@@ -1,4 +1,4 @@
-<h1 align="center">PadCaptioner</h1>
+<h1 align="center">🎬 PadCaptioner</h1>
 
 <h3 align="center">Parallelized Autoregressive Decoding for Omni-Modal Dense Video Captioning</h3>
 
@@ -20,11 +20,13 @@
 ## Demo
 
 <p align="center">
-  <video src="media/padcaptioner_demo.mp4" controls width="90%"></video>
+  <a href="media/padcaptioner_demo.mp4">
+    <img src="media/padcaptioner_demo.gif" width="90%" alt="PadCaptioner demo">
+  </a>
 </p>
 
 <p align="center">
-  <a href="media/padcaptioner_demo.mp4">Click to play the demo video on GitHub</a>
+  <a href="media/padcaptioner_demo.mp4">Click here to watch the demo video in MP4 format</a>
 </p>
 
 
