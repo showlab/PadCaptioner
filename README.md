@@ -11,6 +11,7 @@
 <h3 align="center">ECCV 2026</h3>
 
 <p align="center">
+  <a href="https://arxiv.org/pdf/2607.02963">Paper</a> &nbsp; | &nbsp;
   <a href="#demo">Demo</a> &nbsp; | &nbsp;
   <a href="#news">News</a> &nbsp; | &nbsp;
   <a href="#overview">Overview</a>
