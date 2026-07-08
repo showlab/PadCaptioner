@@ -12,6 +12,7 @@
 
 <p align="center">
   <a href="https://arxiv.org/pdf/2607.02963">Paper</a> &nbsp; | &nbsp;
+  <a href="https://huggingface.co/papers/2607.02963">HF Daily Paper</a> &nbsp; | &nbsp;
   <a href="#demo">Demo</a> &nbsp; | &nbsp;
   <a href="#news">News</a> &nbsp; | &nbsp;
   <a href="#overview">Overview</a>
