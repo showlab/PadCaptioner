@@ -35,7 +35,7 @@
 ## 📢 News
 
 - [2026-06] Our work is accepted by ECCV 2026!
-- [2026-06] 🚧 The paper and code will be released soon. Please give us a ⭐ to stay updated!
+- [2026-06] 🚧 The code will be released soon. Please give us a ⭐ to stay updated!
 
 ## 🔆 Overview
 
