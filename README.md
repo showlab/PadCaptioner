@@ -33,9 +33,9 @@
 
 
 ## 📢 News
-
+- [2026-08] We are currently organizing and cleaning up the code and plan to release it within one week.
 - [2026-07] Our work is featured by [DailyPapers](https://x.com/HuggingPapers/status/2076401494295826468)!
-- [2026-07] Our paper is available on [arXiv](https://arxiv.org/abs/2607.02963). 🚧 The code will be released soon. Please give us a ⭐ to stay updated!
+- [2026-07] Our paper is available on [arXiv](https://arxiv.org/abs/2607.02963).
 - [2026-06] Our work is accepted by ECCV 2026!
 
 ## 🔆 Overview
