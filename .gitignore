@@ -1,0 +1,17 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Environments / editors
+.vscode/
+.idea/
+*.egg-info/
+
+# Run artifacts
+wandb/
+*.log
+
+# Local-only run scripts (machine-specific paths)
+scripts_run/*
+!scripts_run/train.sh
+!scripts_run/test.sh

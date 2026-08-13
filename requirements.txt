@@ -1,0 +1,23 @@
+# Tested environment: Python 3.12, CUDA 12.6
+# Install PyTorch first (with the CUDA build matching your system):
+#   pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+torchcodec==0.4.0
+
+transformers==4.51.3
+accelerate==1.11.0
+deepspeed==0.16.0
+peft==0.15.2
+liger-kernel==0.5.10
+safetensors==0.6.2
+
+numpy==2.2.6
+einops==0.8.1
+pillow==11.3.0
+opencv-python==4.12.0.88
+decord==0.6.0
+
+tqdm==4.67.1
+wandb==0.22.3
