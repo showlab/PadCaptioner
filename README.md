@@ -142,10 +142,12 @@ We list below the related works that inspired PadCaptioner:
 ## 📌 Citation
 If you find our work useful, please kindly cite:
   ```
-  @inproceedings{padcaptioner,
-    title={Parallelized Autoregressive Decoding for Omni-Modal Dense Video Captioning},
-    author={Zeng, Wenzheng and Jiao, Siyi and Gao, Chen and Ng, Hwee Tou and Shou, Mike Zheng},
-    booktitle={European Conference on Computer Vision (ECCV)},
-    year={2026}
-  }
+  @inproceedings{zeng2026parallelized,
+  title={Parallelized Autoregressive Decoding for Omni-Modal Dense Video Captioning},
+  author={Zeng, Wenzheng and Jiao, Siyi and Gao, Chen and Ng, Hwee Tou and Shou, Mike Zheng},
+  booktitle={European Conference on Computer Vision},
+  pages={189--209},
+  year={2026},
+  organization={Springer}
+}
   ```
