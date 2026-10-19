@@ -17,7 +17,6 @@
 
 import os
 from typing import Dict, List, Optional, Sequence
-# from contextlib import contextmanager, nullcontext
 
 from transformers.models.auto.modeling_auto import (
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
@@ -26,7 +25,6 @@ from transformers.models.auto.modeling_auto import (
 
 import torch
 import torch.nn as nn
-# from flash_attn.flash_attn_interface import flash_attn_varlen_func  # unused; flash_attn is optional
 from torch.utils.data import DataLoader, Sampler
 from transformers import Trainer
 from transformers.cache_utils import Cache
@@ -53,14 +51,6 @@ from transformers.trainer_callback import (
 
 import re
 def _is_peft_model(model):
-    # if is_peft_available():
-    #     classes_to_check = (PeftModel,) if is_peft_available() else ()
-    #     # Here we also check if the model is an instance of `PeftMixedModel` introduced in peft>=0.7.0: https://github.com/huggingface/transformers/pull/28321
-    #     if version.parse(importlib.metadata.version("peft")) >= version.parse("0.7.0"):
-    #         from peft import PeftMixedModel
-
-    #         classes_to_check = (*classes_to_check, PeftMixedModel)
-    #     return isinstance(model, classes_to_check)
     return False
 
 class QwenVLTrainer(Trainer):
@@ -70,8 +60,7 @@ class QwenVLTrainer(Trainer):
         *args,
         **kwargs
     ):
-        # Older Trainer versions do not accept label_names in __init__; pop it and set it afterwards
-        # to avoid the PeftModel label_names warning
+        # Older Trainer versions reject label_names in __init__; set it afterwards
         label_names = kwargs.pop("label_names", None)
         super().__init__(*args, **kwargs)
         if label_names is not None:
@@ -265,11 +254,7 @@ class QwenVLTrainer(Trainer):
                 loss_kwargs["num_items_in_batch"] = num_items_in_batch
             inputs = {**inputs, **loss_kwargs}
 
-        train_type = inputs.get("train_type", "")
-        if train_type == "sft":
-            outputs = model(**inputs)
-        else:
-            raise NotImplementedError
+        outputs = model(**inputs)
 
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.

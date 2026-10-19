@@ -296,16 +296,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
 
 
 def _vision_varlen_sdpa(q, k, v, cu_seqlens):
-    """Run SDPA per segment given cu_seqlens; equivalent to block-diagonal mask + one SDPA call,
-    but without materializing the [1, L, L] mask.
-
-    Materializing torch.zeros([1, L, L], dtype=bool) fails on long sequences:
-      1) O(L^2) memory (e.g. bs=3, 256 frames gives L~1e5, ~14GB just for the mask);
-      2) when L^2 exceeds INT32_MAX (2.147e9), 32-bit indexing in the CUDA kernel
-         overflows ("CUDA error: unrecognized error code").
-    The mask is block-diagonal along cu_seqlens (fully visible within a segment, invisible
-    across segments), so per-segment full attention without a mask is mathematically
-    identical and lets SDPA use its efficient backends.
+    """Block-diagonal SDPA over cu_seqlens segments without materializing an [L, L] mask.
 
     q/k/v: [num_heads, seq_len, head_dim]; returns the same shape.
     """
@@ -314,14 +305,14 @@ def _vision_varlen_sdpa(q, k, v, cu_seqlens):
     if lengths.numel() == 0:
         return q
 
-    # Fast path: all segments equal length and covering the whole sequence (common when all frames share h*w); direct view, no gather
+    # Fast path: equal-length segments covering the whole sequence
     if bool((lengths == lengths[0]).all()) and int(cu_seqlens[0]) == 0 and int(cu_seqlens[-1]) == seq_len:
         n, L = lengths.numel(), int(lengths[0])
         qs, ks, vs = (t.view(num_heads, n, L, head_dim).transpose(0, 1) for t in (q, k, v))
         o = F.scaled_dot_product_attention(qs, ks, vs, dropout_p=0.0)  # [n, H, L, D]
         return o.transpose(0, 1).reshape(num_heads, seq_len, head_dim)
 
-    # General path: group segments by length and batch equal-length segments into one SDPA call (usually few distinct lengths)
+    # General path: batch equal-length segments into one SDPA call
     out = torch.empty_like(q)
     starts = cu_seqlens[:-1]
     for length in torch.unique(lengths):
@@ -371,7 +362,7 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
         v = v.transpose(0, 1)
-        # Segmented SDPA instead of a dense [1, L, L] mask: avoids O(L^2) memory and INT32 index overflow on long sequences (large batch / many frames)
+        # Segmented SDPA avoids O(L^2) mask memory and int32 index overflow on long sequences
         attn_output = _vision_varlen_sdpa(q, k, v, cu_seqlens)
         attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.reshape(seq_length, -1)
@@ -1217,6 +1208,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         vision_start_positions: Optional[torch.LongTensor] = None,
         vision_end_positions: Optional[torch.LongTensor] = None,
         event_id: Optional[torch.LongTensor] = None,
+        event_vision_visible: Optional[List[torch.Tensor]] = None,
         output_attentions_layer_index: Optional[int] = None,
         output_hidden_states_layer_index: Optional[Union[int, List[int]]] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
@@ -1263,6 +1255,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             vision_start_positions=vision_start_positions,
             vision_end_positions=vision_end_positions,
             event_id=event_id,
+            event_vision_visible=event_vision_visible,
         )
 
         hidden_states = inputs_embeds
@@ -1271,7 +1264,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
-        # If only specific layers' hidden_states are needed, store just those to save memory (accepts int or list; negative indices like -2 supported)
+        # Optionally keep only the requested layers' hidden states (int or list, negative indices allowed)
         num_hidden_slots = len(self.layers) + 1  # slots 0..num_layers-1 are pre-layer states; slot num_layers is post-norm
         if output_hidden_states and output_hidden_states_layer_index is not None:
             _idx = output_hidden_states_layer_index
@@ -1281,7 +1274,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         else:
             _requested = None
             all_hidden_states = () if output_hidden_states else None
-        # If only one layer's attention is needed, request/store it only at that layer, saving memory (otherwise every layer stores [B, num_heads, L, L])
+        # Optionally compute attention weights only at one layer
         if output_attentions and output_attentions_layer_index is not None:
             all_self_attns = [None] * len(self.layers)
         else:
@@ -1325,7 +1318,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
-            if use_cache:   # if this layer outputs attention weights the cache is the third return value, otherwise the second
+            if use_cache:   # cache index shifts by one when attention weights are returned
                 next_decoder_cache = layer_outputs[2 if output_attentions_this_layer else 1]
 
             if output_attentions:
@@ -1347,7 +1340,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
-        # Originally a tuple; a list means the layer-specific path was used, so convert back to tuple for consistency
+        # Layer-specific path builds a list; convert back to tuple
         if output_attentions and isinstance(all_self_attns, list):
             all_self_attns = tuple(all_self_attns)
         if not return_dict:
@@ -1369,6 +1362,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         vision_start_positions: Optional[torch.LongTensor] = None,
         vision_end_positions: Optional[torch.LongTensor] = None,
         event_id: Optional[torch.LongTensor] = None,
+        event_vision_visible: Optional[List[torch.Tensor]] = None,
     ):
         if self.config._attn_implementation == "flash_attention_2" and getattr(self.config, 'use_flashattention', False):
             if attention_mask is not None and past_key_values is not None:
@@ -1391,8 +1385,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         using_static_cache = isinstance(past_key_values, StaticCache)
         using_sliding_window_cache = isinstance(past_key_values, SlidingWindowCache)
 
-        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-        # However, if use_flashattention=False and vision-token mutual visibility is needed, we must build a mask instead of returning None
+        # Without flash attention, vision-token mutual visibility needs an explicit mask
         need_vision_token_visible = (
             not getattr(self.config, 'use_flashattention', True)
             and vision_start_positions is not None
@@ -1411,7 +1404,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 sliding_window=self.config.sliding_window,
                 is_training=self.training,
             ):
-                # If vision-token visibility is needed, we cannot return None; a mask must be built
+                # Vision-token visibility requires an explicit mask
                 if not need_vision_token_visible:
                     return None
 
@@ -1443,6 +1436,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             vision_start_positions=vision_start_positions,
             vision_end_positions=vision_end_positions,
             event_id=event_id,
+            event_vision_visible=event_vision_visible,
         )
 
         if (
@@ -1470,39 +1464,29 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         sequence_length: int,
         target_length: int,
     ) -> torch.Tensor:
-        """
-        When use_flashattention=False, allow vision tokens to attend to each other in the causal_mask.
-        Visibility is set per batch sample based on its vision token start/end positions.
-        Caller must ensure this is only invoked when not use_flashattention and both
-        vision_start/end_positions are not None.
-
-        Accepts 2D or 4D input: a 4D [batch_size, 1, sequence_length, target_length] mask
-        (shape after the event_id step) is squeeze(1)-ed to 3D before zeroing the vision region;
-        a 2D mask is unsqueeze(0).expand-ed to 3D as before.
+        """Make each sample's vision tokens mutually visible (bidirectional) in a 2D or 4D causal mask.
 
         Returns:
-            Updated causal_mask of shape [batch_size, sequence_length, target_length]
+            Causal mask of shape [batch_size, sequence_length, target_length].
         """
         device = causal_mask.device
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         
-        # 4D input (after the event_id step): [batch_size, 1, sequence_length, target_length] -> [batch_size, sequence_length, target_length]
+        # [B, 1, Q, K] -> [B, Q, K]
         if causal_mask.dim() == 4:
             causal_mask_batch = causal_mask.squeeze(1).clone()
         else:
-            # Original 2D input: [sequence_length, target_length] -> [batch_size, sequence_length, target_length]
+            # [Q, K] -> [B, Q, K]
             causal_mask_batch = causal_mask.unsqueeze(0).expand(batch_size, -1, -1).clone()
 
-        # Convert vision_start_positions and vision_end_positions to tensors
         if vision_start_positions.dim() > 0:
             vision_start_abs = (vision_start_positions[:batch_size] + 1).to(device)  # (batch_size,)
             vision_end_abs = vision_end_positions[:batch_size].to(device)  # (batch_size,)
         else:
-            # Single value: expand to all batch samples
             vision_start_abs = (vision_start_positions + 1).unsqueeze(0).expand(batch_size).to(device)  # (batch_size,)
             vision_end_abs = vision_end_positions.unsqueeze(0).expand(batch_size).to(device)  # (batch_size,)
         
-        # Compute absolute key-side positions (shared across the batch)
+        # Absolute key positions (shared across the batch)
         key_range = min(target_length, past_seen_tokens + sequence_length)
         if key_range == 0:
             return causal_mask_batch
@@ -1515,7 +1499,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             take = min(num_rest, cache_position.shape[0])
             key_abs_positions[past_seen_tokens : past_seen_tokens + take] = cache_position[:take].to(device)
         
-        # Process each batch sample separately
         valid_query_len = min(sequence_length, cache_position.shape[0])
         if valid_query_len == 0:
             return causal_mask_batch
@@ -1525,11 +1508,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             vision_start_b = vision_start_abs[b].item()
             vision_end_b = vision_end_abs[b].item()
             
-            # Check whether query positions fall inside this sample's vision range
             in_vision_q = (abs_positions_q >= vision_start_b) & (abs_positions_q < vision_end_b)  # (valid_query_len,)
             vision_query_indices = torch.where(in_vision_q)[0]  # (num_vision_queries,)
             
-            # Check whether key positions fall inside this sample's vision range
             in_vision_k = (key_abs_positions >= vision_start_b) & (key_abs_positions < vision_end_b) & (key_abs_positions >= 0)  # (key_range,)
             vision_key_indices = torch.where(in_vision_k)[0]  # (num_vision_keys,)
             
@@ -1553,129 +1534,103 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         device: torch.device,
         dtype: torch.dtype,
         min_dtype: float,
+        event_vision_visible: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """
-        Update the causal_mask visibility rules according to event_id.
-
-        Rule: query position q may attend to key position k iff both hold:
-        1. k <= q (causality)
-        2. event_id[k] == -1 (e.g. global tokens) or event_id[k] == event_id[q]
+        """Restrict attention by event_id: q sees k iff k <= q and (event_id[k] == -1 or event_id[k] == event_id[q]).
 
         Args:
-            causal_mask: current causal mask, shape [batch_size, 1, sequence_length, target_length] (4D)
-            event_id: list of length batch_size; each element is a tensor (possibly None) for one batch sample
-            sequence_length: query sequence length
-            target_length: key sequence length
-            batch_size: batch size
-            device: device
-            dtype: data type
-            min_dtype: minimum value used for masking
+            causal_mask: [batch_size, 1, sequence_length, target_length].
+            event_id: per-sample event-id tensors (None entries are left unchanged).
+            event_vision_visible: optional per-sample [num_events, target_length] bool masks limiting
+                which vision keys each event's tokens may see.
 
         Returns:
-            Updated causal_mask, shape [batch_size, 1, sequence_length, target_length] (4D)
+            Updated causal_mask of shape [batch_size, 1, sequence_length, target_length].
         """
-        # Drop the head dim: [batch_size, 1, sequence_length, target_length] -> [batch_size, sequence_length, target_length]
         if causal_mask.dim() == 4:
             causal_mask_batch = causal_mask.squeeze(1).clone()
 
         if event_id is None or len(event_id) == 0:
-            # No event_id: restore the head dim and return
             return causal_mask_batch.unsqueeze(1)  # [batch_size, 1, sequence_length, target_length]
 
-        # event_id list length must equal batch_size
         if len(event_id) != batch_size:
             raise ValueError(f"event_id list length ({len(event_id)}) must equal batch_size ({batch_size})")
 
-        # Position indices (shared across the batch)
         q_indices = torch.arange(sequence_length, device=device).unsqueeze(1)  # [sequence_length, 1]
         k_indices = torch.arange(target_length, device=device).unsqueeze(0)   # [1, target_length]
 
-        # Process each batch sample separately
         for b in range(batch_size):
             if sequence_length > 1:  # training phase
                 eid = event_id[b]
 
-                # Skip samples with event_id None (keep the original causal_mask)
                 if eid is None:
                     continue
 
-                # Move event_id to the right device
                 eid = eid.to(device)
 
-                # Match event_id length to target_length
-                valid_length = min(eid.shape[0], target_length) # lengths can genuinely differ due to batching, not just for safety
+                valid_length = min(eid.shape[0], target_length) # lengths can differ due to batching
                 if eid.shape[0] > target_length:
                     event_id_for_mask = eid[:target_length]
                 else:
                     event_id_for_mask = eid
 
-                # Per-position event_id
-                # event_id_k: event_id of key position k, shape [1, target_length]
-                # Valid positions (k < valid_length) use event_id_for_mask[k];
-                # padding positions (k >= valid_length) use the sentinel -2 and are invisible
+                # Key-side event ids; padding uses sentinel -2 (matches nothing)
                 event_id_k_full = torch.full((target_length,), -2, dtype=eid.dtype, device=device)  # -2 marks padding (invisible)
                 event_id_k_full[:valid_length] = event_id_for_mask
                 event_id_k = event_id_k_full.unsqueeze(0)  # [1, target_length]
 
-                # event_id_q: event_id of query position q
-                # Query positions should all be in range; clamp to the last valid value otherwise
                 q_clamped = torch.clamp(q_indices.squeeze(1), 0, valid_length - 1)  # [sequence_length]
                 event_id_q = event_id_for_mask[q_clamped].unsqueeze(1)  # [sequence_length, 1]
 
-                # Event-match mask: event_id_k == -1 or event_id_k == event_id_q
-                # Note: padding positions (event_id_k == -2) match nothing (neither -1 nor event_id_q), so they stay invisible
-                # event_id_k: [1, target_length], event_id_q: [sequence_length, 1]
-                # After broadcast: [sequence_length, target_length]
                 event_match = (event_id_k == -1) | (event_id_k == event_id_q)  # [sequence_length, target_length]
-                # Attention is allowed only when the key is global (event_id == -1) or in the same event group (equal event_id)
-                # Combine with causality: k <= q
                 k_le_q = k_indices <= q_indices  # [sequence_length, target_length]
 
-                # Final event_mask: requires both causality (k <= q) and event match
-                # Padding positions (event_id_k == -2) are automatically excluded since event_match is False
                 event_mask = k_le_q & event_match  # [sequence_length, target_length]
 
-                # Apply event_mask to this sample's causal_mask
-                # Disallowed positions (event_mask False) are set to min_dtype
-                # Padding positions keep their min_dtype (invisible) since event_match is False
+                # Interval-restricted branch attention: event e's tokens see only vision keys in row e
+                # (mirrors _build_branch_prefix_visibility at inference)
+                if (event_vision_visible is not None and b < len(event_vision_visible)
+                        and event_vision_visible[b] is not None):
+                    evv = event_vision_visible[b].to(device)
+                    if evv.shape[1] < target_length:
+                        evv = torch.cat([evv, torch.ones(evv.shape[0], target_length - evv.shape[1],
+                                                         dtype=torch.bool, device=device)], dim=1)
+                    evv = evv[:, :target_length]
+                    eq = event_id_q.squeeze(1)                               # [sequence_length]
+                    rows = (eq >= 0) & (eq < evv.shape[0])
+                    if rows.any():
+                        allow = torch.ones_like(event_mask)
+                        allow[rows] = evv[eq[rows]]
+                        event_mask = event_mask & allow
+
                 causal_mask_batch[b] = causal_mask_batch[b].masked_fill(~event_mask, min_dtype)
             else:   # inference generating phase
-                # Update the causal mask only for this step's input token (the last row), layering the
-                # event-match rule on top of the existing causal mask.
-                # The input event_id covers all tokens in the sequence; its last element is this step's token.
-                # That token may see all tokens with event_id -1, plus preceding tokens with the same event_id.
+                # Apply the event-match rule to the last (current) query row only
                 eid = event_id[b]
                 if eid is None:
                     continue
                 eid = eid.to(device)
 
-                # Valid key length (usually equals target_length; truncate for safety)
                 valid_length = min(eid.shape[0], target_length)
                 if valid_length <= 0:
-                    # No valid tokens: whole row invisible
                     causal_mask_batch[b, -1, :] = min_dtype
                     continue
 
-                # Build key-side event_id (padding positions use -2, invisible)
+                # Key-side event ids; padding uses sentinel -2
                 event_id_k_full = torch.full((target_length,), -2, dtype=eid.dtype, device=device )
-                event_id_k_full[:valid_length] = eid[:valid_length]  # keep the first valid_length entries
-                # Current query token: event_id of the last valid token
+                event_id_k_full[:valid_length] = eid[:valid_length]
                 event_id_q = eid[valid_length - 1]
 
-                # Event match: (-1 globally visible) or (same event_id)
                 event_match_row = (event_id_k_full == -1) | (event_id_k_full == event_id_q)  # [target_length]
 
-                # Causality: key position <= current query's absolute position (valid_length-1)
                 k_le_q_row = torch.arange(target_length, device=device) <= (valid_length - 1)  # [target_length]
 
-                # Final: requires both causality and event match (padding(-2) never matches)
                 allow_row = event_match_row & k_le_q_row  # [target_length]
 
-                # Update only the last query token's row
                 causal_mask_batch[b, -1, :] = causal_mask_batch[b, -1, :].masked_fill(~allow_row, min_dtype)
 
-        # Restore the head dim: [batch_size, sequence_length, target_length] -> [batch_size, 1, sequence_length, target_length]
         return causal_mask_batch.unsqueeze(1)
+
 
     @staticmethod
     def _prepare_4d_causal_attention_mask_with_cache_position(
@@ -1691,6 +1646,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         vision_start_positions: Optional[torch.LongTensor] = None,
         vision_end_positions: Optional[torch.LongTensor] = None,
         event_id: Optional[List[torch.Tensor]] = None,
+        event_vision_visible: Optional[List[torch.Tensor]] = None,
     ):
         """
         Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
@@ -1732,14 +1688,12 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     sliding_attend_mask = torch.arange(target_length, device=device) <= (
                         cache_position.reshape(-1, 1) - config.sliding_window
                     )
-                    diagonal_attend_mask.bitwise_or_(sliding_attend_mask)    # long sequences: mask out tokens beyond the sliding window length
+                    diagonal_attend_mask.bitwise_or_(sliding_attend_mask)
             causal_mask *= diagonal_attend_mask
 
             causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
             if event_id is not None and all(x is not None for x in event_id):
-                # Update causal_mask visibility according to event_id
-                # Input and output shapes are both [batch_size, 1, sequence_length, target_length] (4D)
-                # The function handles visibility per batch sample
+                # Apply event-group visibility; [B, 1, Q, K] in and out
                 causal_mask = Qwen2_5_VLModel._update_causal_mask_with_event_id(
                     causal_mask=causal_mask,
                     event_id=event_id,
@@ -1749,10 +1703,10 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     device=device,
                     dtype=dtype,
                     min_dtype=min_dtype,
+                    event_vision_visible=event_vision_visible,
                 )
 
             if not (getattr(config, 'use_flashattention', True) or vision_start_positions is None or vision_end_positions is None):
-                # Returns shape [batch_size, sequence_length, target_length]
                 causal_mask = Qwen2_5_VLModel._allow_vision_tokens_mutual_visibility(
                     causal_mask=causal_mask,
                     config=config,
@@ -1764,7 +1718,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     sequence_length=sequence_length,
                     target_length=target_length,
                 )
-                # Add the head dim: [batch_size, sequence_length, target_length] -> [batch_size, 1, sequence_length, target_length]
+                # [B, Q, K] -> [B, 1, Q, K]
                 causal_mask = causal_mask.unsqueeze(1)
 
                 
@@ -1921,8 +1875,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.rope_deltas = None  # cache rope_deltas here
 
-        # frm_head and evi_head (used in evidence mode)
-        # Note: use_evidence may be set dynamically after model creation, so both heads are always created
+        # Grounding heads: per-timestep (frm) and <G>-query (evi) projections; always created
         hidden_size = config.hidden_size
         self.frm_head = nn.Sequential(
             nn.LayerNorm(hidden_size), 
@@ -1937,13 +1890,14 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             nn.Linear(hidden_size // 2, hidden_size)
         )
         
-        self.score_head = nn.Sequential(
-            nn.LayerNorm(hidden_size), 
-            nn.Linear(hidden_size, hidden_size // 2), 
-            nn.GELU(),
-            nn.Linear(hidden_size // 2, 1)
-        )
-
+        # Boundary heads: start/end queries from <G> and a per-timestep projection; always
+        # created so checkpoints load uniformly, used only when boundary loss/snapping is on.
+        self.bnd_frm_head = nn.Sequential(
+            nn.LayerNorm(hidden_size), nn.Linear(hidden_size, hidden_size // 2), nn.GELU(),
+            nn.Linear(hidden_size // 2, hidden_size))
+        self.bnd_evi_head = nn.Sequential(
+            nn.LayerNorm(hidden_size), nn.Linear(hidden_size, hidden_size // 2), nn.GELU(),
+            nn.Linear(hidden_size // 2, 2 * hidden_size))
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -2111,18 +2065,16 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                         .flatten()
                     )
                     video_pos = torch.stack([t_index, h_index, w_index]) + text_len + st_idx
-                    # llm_pos_ids_list.append(video_pos)
 
                     audio_len = audio_lengths[video_index]
 
-                    time_index_audio = torch.arange(audio_len, device=input_ids.device) # audio sampling rate is 0.5, so a step of 1 matches the temporal spacing
+                    time_index_audio = torch.arange(audio_len, device=input_ids.device)
                     w_index_audio = time_index_audio
                     h_index_audio = torch.zeros_like(time_index_audio)
                     audio_pos = torch.stack([time_index_audio, h_index_audio, w_index_audio]) + st_idx + text_len
-                    # llm_pos_ids_list.append(audio_pos)
                     audio_visual_pos = torch.zeros_like(torch.cat((video_pos, audio_pos), dim=1))
                     st = ed + llm_grid_t * llm_grid_h * llm_grid_w + audio_len
-                    audio_visual_pos[:, input_ids[ed:st] == audio_token_id] = audio_pos # tokens here are already interleaved, so positions are written into the selected tokens in order
+                    audio_visual_pos[:, input_ids[ed:st] == audio_token_id] = audio_pos # tokens are interleaved
                     audio_visual_pos[:, input_ids[ed:st] == video_token_id] = video_pos
                     llm_pos_ids_list.append(audio_visual_pos)
                     video_index += 1
@@ -2305,7 +2257,6 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                         ed_audio = len(input_tokens) + 1
                     ed = ed_audio
                     
-                    # audio_lengths is already a token count, used directly as the temporal token count
                     llm_grid_t = audio_lengths[audio_index]  # temporal token count
                     llm_grid_h = 1  # audio has no height dim, fixed to 1
                     llm_grid_w = 1  # audio has no width dim, fixed to 1
@@ -2457,10 +2408,8 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             return inputs_embeds
 
     def _register_attn_row_capture(self, layer_idx):
-        """Register a pre-hook on layer layer_idx's self_attn to capture its input hidden states
-        and position embeddings. Used to recompute the "last text token vs. full sequence"
-        attention row in O(L*d), instead of materializing the whole layer's [B, H, L, L]
-        via output_attentions (O(L^2) memory). Caller must handle.remove() afterwards."""
+        """Hook layer `layer_idx`'s self-attention to capture its inputs for a cheap single-row
+        attention recompute. Caller must call handle.remove()."""
         storage = {}
         attn_module = self.model.layers[layer_idx].self_attn
 
@@ -2474,12 +2423,11 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         return handle, storage
 
     def _attn_row_from_capture(self, storage, last_text_token_indices, layer_idx):
-        """Recompute the target attention row from the captured layer input, step-for-step
-        matching the eager implementation: q/k projection -> M-RoPE -> GQA repeat ->
-        scores/sqrt(d) + causal mask -> fp32 softmax -> average over heads.
-        Returns [B, seq_len, 1], numerically matching the sliced result of the old
-        output_attentions path (within bf16 precision). Gradients flow through the q/k
-        projections and hidden as usual, so training semantics are equivalent."""
+        """Recompute the head-averaged attention row of the last text token from captured inputs.
+
+        Returns:
+            [B, seq_len, 1], matching the eager attention output for that row.
+        """
         attn_module = self.model.layers[layer_idx].self_attn
         hidden = storage['hidden']                                   # [B, L, hidden_size]
         cos, sin = storage['position_embeddings']
@@ -2501,30 +2449,143 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         causal_mask = storage.get('attention_mask')
         if causal_mask is not None:                                   # 4D additive mask [B, 1, L, kv_len]
             scores = scores + causal_mask[batch_arange, 0, idx][:, None, :]
-        else:                                                         # mask is None on the sdpa is_causal fast path; apply this row's causal constraint manually
+        else:                                                         # sdpa is_causal path: apply causal mask manually
             invisible = torch.arange(seq_len, device=hidden.device).unsqueeze(0) > idx.unsqueeze(1)  # [B, L]
             scores = scores.masked_fill(invisible.unsqueeze(1), torch.finfo(scores.dtype).min)
 
         probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(hidden.dtype)  # fp32 softmax, matching eager
         return probs.mean(dim=1).unsqueeze(-1)                        # [B, seq_len, 1]
 
-    def find_and_merge(self, matrix):
-        """Grounding readout for one event token: similarity scores -> ONE interval.
 
-        Expects 1D [num_timesteps] (a leading batch dim of 1 is squeezed). Steps:
-          1. threshold: timesteps scoring >= grounding_threshold * max are salient
-             (paper setting: 0.5 for LongVALE, 0.7 for ChronusAV);
-          2. group salient timesteps into contiguous runs;
-          3. bridge runs whose gap <= grounding_merge_gap timesteps -- close runs are one
-             event interrupted by noise, far-apart runs are NOT collapsed into one span
-             (the old first-to-last-salient span inflated intervals ~2.7x vs GT);
-          4. pick ONE winner among the merged candidates by grounding_select:
-               "mass"    (default) sum of scores over the segment -- rewards segments that
-                         are both strong and long; a single-step spike cannot outrank a
-                         sustained event, and a long weak tail cannot outrank a solid core
-               "longest" longest duration
-               "mean"    highest mean score (biases toward short spikes; kept for ablation)
-        Returned as [[start, end]] so downstream per-event interval lists keep their shape.
+    @staticmethod
+    def _soft_iou_loss(sim_pred, sim_tgt, cov_w=None):
+        """Mean (1 - soft temporal IoU) over events; sim_pred is [K, T] logits. Returns None if no positives."""
+        p = torch.sigmoid(sim_pred.float())
+        t = (sim_tgt >= 0.999).float()
+        if cov_w is not None:                     # drop claimed timesteps
+            p, t = p * cov_w, t * cov_w
+        valid = t.sum(dim=1) > 0
+        if not valid.any():
+            return None
+        p, t = p[valid], t[valid]
+        inter = (p * t).sum(dim=1)
+        union = (p + t - p * t).sum(dim=1)
+        return (1.0 - inter / union.clamp_min(1e-6)).mean()
+
+
+    def _boundary_sims(self, hidden_b, bnd_info):
+        """Start/end boundary logits [T] from a <G> hidden state [H] and boundary features [T, H]."""
+        q = self.bnd_evi_head(hidden_b.unsqueeze(0))                        # [1, 2H]
+        qs, qe = q.split(q.shape[-1] // 2, dim=-1)
+        scale = qs.shape[-1] ** 0.5
+        bi = bnd_info.to(qs.dtype)
+        return (qs @ bi.t() / scale).squeeze(0).float(), (qe @ bi.t() / scale).squeeze(0).float()
+
+    def _snap_readout(self, pred, sim_s, sim_e):
+        """Snap predicted interval edges to the start/end boundary peaks within grounding_snap_window."""
+        win = int(getattr(self.config, 'grounding_snap_window', 0) or 0)
+        if not pred or win <= 0 or sim_s is None:
+            return pred
+        st, en = int(pred[0][0]), int(pred[0][1])
+        T = sim_s.shape[0]
+        a, c = max(0, st - win), min(T - 1, st + win)
+        st2 = a + int(torch.argmax(sim_s[a:c + 1]).item())
+        a, c = max(0, en - win), min(T - 1, en + win)
+        en2 = a + int(torch.argmax(sim_e[a:c + 1]).item())
+        # Move an edge only to a strictly higher peak
+        if not (sim_s[st2] > sim_s[st]):
+            st2 = st
+        if not (sim_e[en2] > sim_e[en]):
+            en2 = en
+        if st2 > en2:
+            return pred
+        return [[st2, en2]]
+
+    def _boundary_loss(self, b, inds, hidden_all, bnd_frm_tokens_all, dist, vs, ve, input_ids, vid_per_ts, aud_per_ts):
+        """Balanced BCE of start/end boundary curves against decaying peaks at GT boundaries.
+
+        dist: [K, T] distance of each timestep to the GT interval (0 inside).
+        """
+        inside = dist == 0
+        valid = inside.any(dim=1)
+        if not valid.any():
+            return None
+        K, T = dist.shape
+        ar = torch.arange(T, device=dist.device, dtype=torch.float32)
+        s_idx = torch.where(inside, ar.unsqueeze(0), torch.full_like(dist, float(T))).min(dim=1).values
+        e_idx = torch.where(inside, ar.unsqueeze(0), torch.full_like(dist, -1.0)).max(dim=1).values
+        decay = float(getattr(self.config, 'grounding_boundary_decay', 1.0) or 1.0)
+        tgt_s = torch.pow(0.5, (ar.unsqueeze(0) - s_idx.unsqueeze(1)).abs() * decay)
+        tgt_e = torch.pow(0.5, (ar.unsqueeze(0) - e_idx.unsqueeze(1)).abs() * decay)
+        frm_tokens = bnd_frm_tokens_all[b, vs[b].item() + 1:ve[b].item()]
+        info = self._compute_vision_info_per_timestep(
+            b=b, vision_start_positions=vs, vision_end_positions=ve, input_ids=input_ids,
+            frm_vision_tokens=frm_tokens, num_timesteps=T,
+            video_token_indices_per_timestep=vid_per_ts, audio_token_indices_per_timestep=aud_per_ts)
+        if info.shape[0] != T:
+            return None
+        q = self.bnd_evi_head(hidden_all[b][inds])                           # [K', 2H]
+        qs, qe = q.split(q.shape[-1] // 2, dim=-1)
+        n = min(qs.shape[0], K)
+        scale = qs.shape[-1] ** 0.5
+        sim_s = (qs[:n] @ info.t() / scale).float()
+        sim_e = (qe[:n] @ info.t() / scale).float()
+        tgt_s, tgt_e, valid = tgt_s[:n], tgt_e[:n], valid[:n]
+        if not valid.any():
+            return None
+        vf = valid.float()
+        def bal(logit, tgt):
+            pos, neg = tgt, 1.0 - tgt   # positives and negatives each weigh 0.5 per row
+            w = pos * (0.5 / pos.sum(1, keepdim=True).clamp_min(1e-6)) + neg * (0.5 / neg.sum(1, keepdim=True).clamp_min(1e-6))
+            bce = F.binary_cross_entropy_with_logits(logit, tgt, reduction='none')
+            return ((bce * w).sum(1) * vf).sum() / vf.sum()
+        loss = bal(sim_s, tgt_s) + bal(sim_e, tgt_e)
+        # Internal-peak suppression: inside an event, start/end curves stay below their true-boundary values by a margin
+        rank_w = float(getattr(self.config, 'loss_boundary_rank_weight', 0.0) or 0.0)
+        self._last_bnd_rank = None
+        if rank_w > 0:
+            margin = float(getattr(self.config, 'grounding_boundary_rank_margin', 1.0) or 1.0)
+            ar_i = torch.arange(T, device=dist.device)
+            tot, cnt = sim_s.new_zeros(()), 0
+            for k in range(n):
+                if not valid[k]:
+                    continue
+                s0, e0 = int(s_idx[k].item()), int(e_idx[k].item())
+                if e0 - s0 < 2:
+                    continue                                      # no strictly-internal steps
+                inner = ar_i[(ar_i > s0) & (ar_i < e0)]
+                tot = tot + F.relu(margin + sim_e[k, inner] - sim_e[k, e0]).mean() \
+                          + F.relu(margin + sim_s[k, inner] - sim_s[k, s0]).mean()
+                cnt += 1
+            if cnt:
+                self._last_bnd_rank = tot / cnt
+        return loss
+
+    def _plateau_loss(self, sim_pred, dist, cov_w=None):
+        """Hinge loss keeping the curve above ratio * inside-max within the GT interval and below it just outside."""
+        ratio = float(getattr(self.config, 'grounding_plateau_ratio', 0.7) or 0.7)
+        s = torch.sigmoid(sim_pred.float())                        # [K', T]
+        n = min(s.shape[0], dist.shape[0]); s, d = s[:n], dist[:n]
+        inside = d == 0; near = (d > 0) & (d <= 2)
+        valid = inside.any(dim=1)
+        if not valid.any():
+            return None
+        neg_inf = torch.full_like(s, -1.0)
+        mx = torch.where(inside, s, neg_inf).max(dim=1, keepdim=True).values   # inside max per event
+        lvl = ratio * mx
+        w_in = inside.float(); w_near = near.float()
+        if cov_w is not None:
+            w_near = w_near * cov_w[:n].float()                      # claimed steps are not negatives
+        l_in = (F.relu(lvl - s) * w_in).sum(1) / w_in.sum(1).clamp_min(1)
+        l_out = (F.relu(s - lvl) * w_near).sum(1) / w_near.sum(1).clamp_min(1)
+        vf = valid.float()
+        return ((l_in + l_out) * vf).sum() / vf.sum()
+
+    def find_and_merge(self, matrix):
+        """Convert a [num_timesteps] score curve into one interval [[start, end]].
+
+        Thresholds at grounding_threshold * max, bridges gaps <= grounding_merge_gap,
+        and keeps the merged segment with the largest score mass.
         """
         if matrix.dim() == 2:
             matrix = matrix.squeeze(0)
@@ -2534,7 +2595,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         if not salient:
             return []
 
-        # contiguous runs of salient timesteps
+        # Contiguous runs of salient timesteps
         runs = [[salient[0], salient[0]]]
         for t in salient[1:]:
             if t == runs[-1][1] + 1:
@@ -2542,8 +2603,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             else:
                 runs.append([t, t])
 
-        # bridge small gaps (in timesteps; at 256-frame sampling one step is ~2s for a
-        # typical few-minute video, so the default 2 bridges gaps of roughly <= 4-6s)
+        # Bridge small gaps (in timesteps)
         merge_gap = getattr(self.config, 'grounding_merge_gap', 2)
         merged = [runs[0]]
         for st, en in runs[1:]:
@@ -2553,15 +2613,9 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 merged.append([st, en])
 
         if len(merged) == 1:
-            return [[merged[0][0], merged[0][1]]]
-        select = getattr(self.config, 'grounding_select', 'mass')
-        if select == 'longest':
-            score = lambda seg: seg[1] - seg[0]
-        elif select == 'mean':
-            score = lambda seg: matrix[seg[0]:seg[1] + 1].mean().item()
-        else:  # 'mass'
-            score = lambda seg: matrix[seg[0]:seg[1] + 1].sum().item()
-        best = max(merged, key=score)
+            best = merged[0]
+        else:
+            best = max(merged, key=lambda seg: matrix[seg[0]:seg[1] + 1].sum().item())
         return [[best[0], best[1]]]
 
     def _prepare_first_forward_pass(
@@ -2572,17 +2626,11 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         position_ids: Optional[torch.LongTensor],
         last_text_token_indices: Optional[torch.LongTensor] = None,
     ):
-        """
-        Prepare the first forward pass: truncate the sequence at the vision_end position.
+        """Truncate each sample at <|vision_end|> (or the last text token) for the first forward pass.
 
         Returns:
-            input_ids_part1: truncated input_ids
-            inputs_embeds_part1: truncated inputs_embeds
-            labels_part1: truncated labels (if labels is not None)
-            attention_mask_part1: truncated attention_mask
-            position_ids_part1: truncated position_ids (if position_ids is not None)
-            vision_start_positions: position indices of vision_start
-            vision_end_positions: position indices of vision_end
+            Truncated (input_ids, inputs_embeds, labels, attention_mask, position_ids),
+            plus vision_start_positions and vision_end_positions.
         """
         vision_end_positions = None
         vision_start_positions = None
@@ -2593,24 +2641,20 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         position_ids_part1 = None
         
         if input_ids is not None:
-            # Find each sample's <|vision_end|> position (one per sample)
+            # Per-sample <|vision_end|> / <|vision_start|> positions
             vision_end_mask = input_ids == self.config.vision_end_token_id  # [batch_size, seq_len]
             vision_end_positions = torch.argmax(vision_end_mask.long(), dim=1)  # [batch_size]
             
-            # Find each sample's <|vision_start|> position (one per sample)
             vision_start_mask = input_ids == self.config.vision_start_token_id  # [batch_size, seq_len]
             vision_start_positions = torch.argmax(vision_start_mask.long(), dim=1)  # [batch_size]
             
-            # Truncate each sample at vision_end_positions, keeping only tokens up to and including <|vision_end|>
             batch_size = input_ids.shape[0]
             if last_text_token_indices is not None:
-                # Find each sample's text end position
                 text_end_positions = last_text_token_indices.to(device=input_ids.device).squeeze(-1)
-                max_length = (text_end_positions).max().item() + 1  # max length within the batch (including vision_end)
+                max_length = (text_end_positions).max().item() + 1
             else:
-                max_length = (vision_end_positions).max().item() + 1  # max length (including vision_end)
+                max_length = (vision_end_positions).max().item() + 1
 
-            # Truncate sequences
             truncated_input_ids = []
             truncated_inputs_embeds = []
             truncated_labels = []  
@@ -2623,11 +2667,10 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     truncated_labels.append(labels[b, :end_pos])
                 truncated_position_ids.append(position_ids[:, b, :end_pos])  # [3, end_pos]
             
-            # Update input_ids
             pad_token_id = 151643
             input_ids_part1 = torch.nn.utils.rnn.pad_sequence(truncated_input_ids, batch_first=True, padding_value=pad_token_id)
             
-            # Update embeddings
+            # Re-pad embeddings, labels, attention mask and position ids
             embed_tokens = self.model.get_input_embeddings()
             pad_token_embedding = embed_tokens(torch.tensor([pad_token_id], device=inputs_embeds.device))  # [1, hidden_size]
             pad_token_embedding = pad_token_embedding.squeeze(0)  # [hidden_size]
@@ -2637,7 +2680,6 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 seq_len = truncated_inputs_embeds[b].shape[0]
                 inputs_embeds_part1[b, :seq_len] = truncated_inputs_embeds[b]
             
-            # Update labels
             if labels is not None:
                 ignore_index = -100  
                 labels_part1 = torch.full((batch_size, max_length),ignore_index,device=labels.device, dtype=labels.dtype)
@@ -2645,10 +2687,8 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     seq_len = truncated_labels[b].shape[0]
                     labels_part1[b, :seq_len] = truncated_labels[b]
 
-            # Update attention_mask
             attention_mask_part1 = (input_ids_part1 != pad_token_id).long()  # [batch_size, max_length]
 
-            # Update position_ids
             if position_ids is not None and position_ids.shape[0] == 3:
                 padded_position_ids_list = []
                 for b in range(batch_size):
@@ -2659,7 +2699,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     else:
                         padded_pos_ids = truncated_position_ids[b]  # [3, max_length]
                     padded_position_ids_list.append(padded_pos_ids)
-                position_ids_part1 = torch.stack(padded_position_ids_list, dim=1)  # Stack: [batch_size, 3, max_length] -> [3, batch_size, max_length]
+                position_ids_part1 = torch.stack(padded_position_ids_list, dim=1)  # [3, batch_size, max_length]
         
         return (
             input_ids_part1,
@@ -2685,17 +2725,17 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         batch_size = input_ids.size(0)
         event_id = [None] * batch_size 
         if mode == "caching":
-            # step1: find vision_end and vision_start positions
+            # Locate the vision span
             vision_end_mask = input_ids == self.config.vision_end_token_id  # [batch_size, seq_len]
             vision_end_positions = torch.argmax(vision_end_mask.long(), dim=1)  # [batch_size]
             vision_start_mask = input_ids == self.config.vision_start_token_id  # [batch_size, seq_len]
             vision_start_positions = torch.argmax(vision_start_mask.long(), dim=1)  # [batch_size]
-            evi_token_id = self.config.evi_token_id        # evi_token_id = getattr(self.config, "evi_token_id", None)
+            evi_token_id = self.config.evi_token_id
             video_token_id = self.config.video_token_id
             audio_token_id = self.config.audio_token_id
 
 
-            # step2: extract initial states of vision+audio tokens and build video_mask/audio_mask
+            # Collect input embeddings and video/audio masks of the vision span
             vision_audio_hidden_states_ori = None
             video_masks_list = None
             audio_masks_list = None
@@ -2709,7 +2749,6 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     vision_audio_hidden_ori = inputs_embeds[b, start_pos:end_pos]  # [vision_token_len, hidden_size]
                     vision_audio_hidden_states_list_ori.append(vision_audio_hidden_ori)
                     
-                    # Compute video_mask and audio_mask
                     video_mask = input_ids[b, start_pos:end_pos] == video_token_id  # [vision_token_len]
                     audio_mask = input_ids[b, start_pos:end_pos] == audio_token_id  # [vision_token_len]
                     video_masks_list_temp.append(video_mask)
@@ -2718,7 +2757,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 video_masks_list = video_masks_list_temp
                 audio_masks_list = audio_masks_list_temp  
 
-            # Helper: mean token features per time range (simple, unweighted average); same logic as compute_token_means in _prepare_second_forward_pass but without scores
+            # Unweighted mean of token features per time range
             def compute_token_means_no_score(pure_hidden_states, token_indices_list, b):
                 if token_indices_list is not None and b < len(token_indices_list) and token_indices_list[b] is not None:
                     means = []
@@ -2726,7 +2765,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                         if time_range_indices is None or len(time_range_indices) == 0:
                             means.append(None)
                             continue
-                        # Handle a bare single range: with one src/evi this may be (0, 1495); iterating "for start_idx, end_idx in (0,1495)" would fail unpacking 0
+                        # Accept a bare (start, end) pair as a single range
                         if isinstance(time_range_indices, (tuple, list)) and len(time_range_indices) == 2 and not isinstance(time_range_indices[0], (tuple, list)):
                             ranges = [tuple(time_range_indices)]
                         else:
@@ -2746,9 +2785,8 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     return None
                 return means
 
-            # Helper: update evi token embeddings (same as update_evi_embeddings in _prepare_second_forward_pass)
             def update_evi_embeddings(inputs_embeds, evi_indices, video_means, audio_means, b):
-                """Update evi token embeddings by adding the video/audio means at the corresponding positions"""
+                """Add video/audio means to the evi token embeddings."""
                 if inputs_embeds is not None and evi_indices is not None and len(evi_indices) > 0:
                     for i, evi_idx in enumerate(evi_indices):
                         idx = int(evi_idx.item() if torch.is_tensor(evi_idx) else evi_idx)
@@ -2756,40 +2794,35 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                             if video_means is not None and i < len(video_means) and video_means[i] is not None:
                                 inputs_embeds[b, idx] = inputs_embeds[b, idx] + video_means[i]
                             if audio_means is not None and i < len(audio_means) and audio_means[i] is not None:
-                                inputs_embeds[b, idx] = inputs_embeds[b, idx] + audio_means[i] * getattr(self.config, 'audio_mean_weight', 1.0)
+                                inputs_embeds[b, idx] = inputs_embeds[b, idx] + audio_means[i] * float(getattr(self.config, 'audio_mean_weight', 1.0))
 
-            # step3: add the original vision token features onto the src evi tokens
+            # Add mean vision/audio features of each src interval onto its evi token
             for b in range(batch_size):
-                # 3.1) find src evi token positions and check the count
                 evi_mask = input_ids[b] == evi_token_id  # [seq_len]
-                evi_positions = torch.where(evi_mask)[0]  # position indices of all evi tokens
+                evi_positions = torch.where(evi_mask)[0]
                 if len(evi_positions) > 0 and video_token_indices_list_src is not None and b < len(video_token_indices_list_src):
                     assert len(evi_positions) == len(video_token_indices_list_src[b]), f"Sample {b}: valid_evi_indices_src length)"
 
-                    # 3.2) get this sample's vision_audio_hidden_states_ori
                     batch_vision_audio_hidden_ori = vision_audio_hidden_states_ori[b]
 
-                    # 3.2) select initial states of video and audio tokens using the precomputed masks
                     video_mask = video_masks_list[b]
                     audio_mask = audio_masks_list[b]
                     pure_video_hidden_states_ori = batch_vision_audio_hidden_ori[video_mask]  # [num_video_tokens, hidden_size]
                     pure_audio_hidden_states_ori = batch_vision_audio_hidden_ori[audio_mask]  # [num_audio_tokens, hidden_size]
 
-                    # 3.3) compute src video/audio token means (simple average; same as _prepare_second_forward_pass but unweighted)
                     sample_video_means_src = compute_token_means_no_score(pure_video_hidden_states_ori, video_token_indices_list_src, b) if video_token_indices_list_src and len(video_token_indices_list_src) > 0 and b < len(video_token_indices_list_src) else None
                     sample_audio_means_src = compute_token_means_no_score(pure_audio_hidden_states_ori, audio_token_indices_list_src, b) if audio_token_indices_list_src and len(audio_token_indices_list_src) > 0 and b < len(audio_token_indices_list_src) else None
 
-                    # 3.4) update src evi token embeddings
                     update_evi_embeddings(inputs_embeds, evi_positions, sample_video_means_src, sample_audio_means_src, b)
         
         elif mode == "generating":
             assert input_ids.size(1) == 1
-            vision_start_positions, vision_end_positions = None, None  # generating phase uses only the cache; no valid range is returned
+            vision_start_positions, vision_end_positions = None, None  # generating uses the cache only
 
             _evi_like_ids = {self.config.evi_token_id}
             for b in range(batch_size):
                 if input_ids[b].item() in _evi_like_ids:
-                    # cache_timestep_token_ranges is built at caching time from video/audio_token_indices_per_timestep; each step is a (v_idx, a_idx) index tensor pair
+                    # Per-timestep (v_idx, a_idx) token indices built at caching time
                     cached = self.cache_timestep_token_ranges[b]
                     cache_hidden = self.cache_img_state[b]  # [vision_token_len, hidden_size]
                     cache_hidden_score = self.cache_img_state_score[b] if self.cache_img_state_score[b] is not None else None  # [vision_token_len, 1] or None
@@ -2798,20 +2831,20 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     video_list, audio_list = [], []
                     video_scores_list, audio_scores_list = [], []
 
-                    # Read the predicted time ranges for this <G> token (list of ranges, possibly multiple)
+                    # Predicted time ranges for this <G> token
                     if getattr(self, 'serial_end_positions', None) is not None and self.serial_end_positions[b] is not None:
-                        # Parallel anchor evi: keep semantics consistent with planning; reuse the grounding range of the corresponding serial G token
+                        # Parallel anchor: reuse the range of the matching planning <G>
                         anchor_j = cache_position.item() - self.serial_end_positions[b] - 1
                         if 0 <= anchor_j < len(self.serial_evi_tgts[b]):
                             new_tgt = self.serial_evi_tgts[b][anchor_j]
                         else:
                             new_tgt = self.tgt[b][-1] if self.tgt[b] else [[0, 0]]
                     else:
-                        # Serial planning evi: use the range predicted at the previous step, and record it for reuse by parallel anchors
+                        # Planning <G>: use the last predicted range and record it for the anchors
                         new_tgt = self.tgt[b][-1] if self.tgt[b] else [[0, 0]]
                         self.serial_evi_tgts[b].append(new_tgt)
 
-                    # Collect video/audio hidden states and scores within the ranges (supports multiple segments)
+                    # Collect video/audio states and scores within the ranges
                     ts_list = [ts for seg_start, seg_end in new_tgt for ts in range(seg_start, seg_end + 1)]
                     for ts in ts_list:
                         if ts < 0 or ts >= len(cached):
@@ -2826,12 +2859,11 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                             if cache_hidden_score is not None:
                                 audio_scores_list.append(cache_hidden_score[a_idx])
                     
-                    # Compute the video mean (weighted or simple average)
+                    # Video mean (score-weighted if scores exist)
                     if video_list:
                         video_tensor = torch.cat(video_list, dim=0)  # [num_video_tokens, hidden_size]
                         if cache_hidden_score is not None and len(video_scores_list) > 0:
                             video_scores_tensor = torch.cat(video_scores_list, dim=0)  # [num_video_tokens, 1]
-                            # Softmax within the current timestep range, then weight (each range normalized independently)
                             video_scores_tensor = F.softmax(video_scores_tensor.squeeze(-1), dim=0).unsqueeze(-1)  # [num_video_tokens, 1]
                             video_mean = torch.sum(video_tensor * video_scores_tensor, dim=0).to(device=device, dtype=dtype)  # [hidden_size]
                         else:
@@ -2839,43 +2871,36 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     else:
                         video_mean = torch.zeros(hidden_size, device=device, dtype=dtype)
                     
-                    # Compute the audio mean (weighted or simple average)
+                    # Audio mean (score-weighted if scores exist)
                     if audio_list:
                         audio_tensor = torch.cat(audio_list, dim=0)  # [num_audio_tokens, hidden_size]
                         if cache_hidden_score is not None and len(audio_scores_list) > 0:
                             audio_scores_tensor = torch.cat(audio_scores_list, dim=0)  # [num_audio_tokens, 1]
-                            # Softmax within the current timestep range, then weight (each range normalized independently)
                             audio_scores_tensor = F.softmax(audio_scores_tensor.squeeze(-1), dim=0).unsqueeze(-1)  # [num_audio_tokens, 1]
                             audio_mean = torch.sum(audio_tensor * audio_scores_tensor, dim=0).to(device=device, dtype=dtype)  # [hidden_size]
                         else:
                             audio_mean = torch.mean(audio_tensor, dim=0).to(device=device, dtype=dtype)
                     else:
                         audio_mean = torch.zeros(hidden_size, device=device, dtype=dtype)
-                    # Same as _compute_vision_info_per_timestep: video + audio_mean_weight * audio, added back at the current evi position
-                    aw = getattr(self.config, 'audio_mean_weight', 1.0)
+                    aw = float(getattr(self.config, 'audio_mean_weight', 1.0))
                     inputs_embeds[b, 0] = inputs_embeds[b, 0] + video_mean + aw * audio_mean
 
-                    # Count only serial-planning-phase evi tokens (before <S> appears); parallel anchors are not counted
+                    # Count planning <G> tokens only (before <S>)
                     self.evi_count[b] += 1 if self.serial_end_positions[b] is None else 0
 
                 elif input_ids[b].item() == self.config.evi_end_token_id:
-                    # <S> means serial prediction has ended and parallel prediction is about to start
-                    # step1: record the serial endpoint position in the full sequence
+                    # <S> ends serial planning; go parallel when more than one event was planned
                     self.serial_end_positions[b] = cache_position.item()
 
-                    # step2: decide whether to start parallel prediction
                     self.parallel[b] = True if self.evi_count[b] > 1 else False
 
-                # Once parallel decoding has started, record the event id of every token
+                # In parallel decoding, track the event id of every token
                 if self.parallel[b]:
                     if self.event_id[b] is None:
-                        # step1: initialize event ids as a tensor of length cache_position.item()+1 filled with -1
                         self.event_id[b] = torch.full((cache_position.item() + 1,), -1, dtype=torch.long, device=input_ids.device)
 
-                        # Fill in the current token's event id
                         self.event_id[b][-1] = (cache_position.item() - self.serial_end_positions[b] - 1) % self.evi_count[b]
                     else:
-                        # Extend event ids by one element initialized to 0
                         self.event_id[b] = torch.cat([self.event_id[b], torch.tensor([0], dtype=torch.long, device=input_ids.device)])
 
                         self.event_id[b][-1] = (cache_position.item() - self.serial_end_positions[b] - 1) % self.evi_count[b]
@@ -2900,22 +2925,14 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.FloatTensor],
         last_text_to_vision_attn_maps: Optional[torch.Tensor] = None,
     ):
-        """
-        Prepare the second forward pass: extract vision+audio hidden states, compute token means,
-        and update G token embeddings.
+        """Add per-interval video/audio feature means onto <G> token embeddings for the second forward pass.
 
         Args:
-            last_text_to_vision_attn_maps: optional; per-sample attention map of the last text token over the full sequence, shape [B, seq_len, 1]
+            last_text_to_vision_attn_maps: optional [B, seq_len, 1] attention row used to weight the means.
 
         Returns:
-            vision_audio_hidden_states: list of vision+audio token hidden states
-            video_masks_list: list of video token masks
-            audio_masks_list: list of audio token masks
-            G_token_indices_list: list of G token indices (labels != -100, used for tgt)
-            G_token_indices_list_src: list of G token indices (labels == -100, used for src)
-            video_token_means_list: list of video token means
-            audio_token_means_list: list of audio token means
-            inputs_embeds: updated inputs_embeds
+            (vision_audio_hidden_states, video_masks_list, audio_masks_list, evi_token_indices_list,
+            evi_token_indices_list_src, video_token_means_list, audio_token_means_list, inputs_embeds).
         """
 
 
@@ -2929,17 +2946,14 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         video_token_means_list = None
         audio_token_means_list = None
         
-        # step1: extract hidden and initial states of vision+audio tokens; use_score_head decides whether score weighting is applied
-        use_score_head = getattr(self.config, 'use_score_head', False)
+        # Extract hidden/input states of the vision span (and optional attention scores)
         use_attention_head = getattr(self.config, 'use_attention_head', False)
         if vision_start_positions is not None and vision_end_positions is not None:
             vision_audio_layer_index = getattr(self.config, 'vision_audio_layer_index', None)
             if vision_audio_layer_index is not None and hidden_states_part1 is not None:
                 if vision_audio_layer_index < len(hidden_states_part1) and input_ids_part1 is not None:
                     layer_hidden_states = hidden_states_part1[vision_audio_layer_index]  # [batch_size, seq_len, hidden_size]
-                    if use_score_head:
-                        layer_hidden_states_score = F.sigmoid(self.score_head(layer_hidden_states))  # [batch_size, seq_len, 1]
-                    elif use_attention_head and last_text_to_vision_attn_maps is not None:
+                    if use_attention_head and last_text_to_vision_attn_maps is not None:
                         layer_hidden_states_score = last_text_to_vision_attn_maps # [batch_size, seq_len, 1]
                     else:
                         layer_hidden_states_score = None
@@ -2949,7 +2963,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     
                     vision_audio_hidden_states_list = []
                     vision_audio_hidden_states_list_ori = []
-                    vision_audio_hidden_states_score_list = [] if use_score_head or use_attention_head else None
+                    vision_audio_hidden_states_score_list = [] if use_attention_head else None
                     video_masks_list_temp = []
                     audio_masks_list_temp = []
                     for b in range(batch_size):
@@ -2963,7 +2977,6 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                             vision_audio_hidden_states_score_b = layer_hidden_states_score[b, start_pos:end_pos]  # [vision_token_len, 1]
                             vision_audio_hidden_states_score_list.append(vision_audio_hidden_states_score_b)
                         
-                        # Compute video_mask and audio_mask
                         video_mask = input_ids_part1[b, start_pos:end_pos] == video_token_id  # [vision_token_len]
                         audio_mask = input_ids_part1[b, start_pos:end_pos] == audio_token_id  # [vision_token_len]
                         video_masks_list_temp.append(video_mask)
@@ -2974,58 +2987,52 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     video_masks_list = video_masks_list_temp
                     audio_masks_list = audio_masks_list_temp  
 
-        # step2: for each sample, build the evi token index sequence from input_ids (only positions whose evi token loss is not -100 are added)
+        # Split <G> positions into tgt (supervised) and src (labels == -100)
         if input_ids is not None:
             batch_size = input_ids.shape[0]
             evi_token_id = self.config.evi_token_id
-            # torch.where returns positions in order: serial segment first, anchor segment after,
-            # matching tgt's [K serial ranges, K identical anchor ranges] layout one-to-one.
+            # Positions are ordered planning-then-anchor, matching tgt's layout
             evi_token_indices_list = []
             evi_token_indices_list_src = []
 
             for b in range(batch_size):
                 evi_mask = input_ids[b] == evi_token_id  # [seq_len]
-                evi_positions = torch.where(evi_mask)[0]  # position indices of all evi tokens
+                evi_positions = torch.where(evi_mask)[0]
 
-                # Filter: only positions whose labels are not -100 are added (used for tgt)
                 valid_evi_indices = []
-                # Filter: only positions whose labels are -100 are added (used for src)
                 valid_evi_indices_src = []
                 if labels is not None:
                     for pos in evi_positions:
                         pos_item = pos.item()
-                        if pos_item < labels.shape[1]:  # ensure index is valid
+                        if pos_item < labels.shape[1]:
                             if labels[b, pos_item] != -100:
                                 valid_evi_indices.append(pos_item)
                             else:
                                 valid_evi_indices_src.append(pos_item)
                 else:
-                    # Without labels, all evi token positions go into valid_evi_indices
                     valid_evi_indices = [pos.item() for pos in evi_positions]
 
-                # Check: len(valid_evi_indices) * 2 should equal this sample's tgt length
                 if tgt is not None and b < len(tgt):
                     expected_length = len(valid_evi_indices) * 2
                     actual_length = len(tgt[b]) if isinstance(tgt[b], (list, tuple)) else 0
                     assert expected_length == actual_length, f"Sample {b}: valid_evi_indices length * 2 ({expected_length}) != tgt length ({actual_length})"
                     evi_token_indices_list.append(valid_evi_indices)
 
-                # Check: len(valid_evi_indices_src) should equal len(video_token_indices_list_src[b])
-                # Distributed training: assert only when video_token_indices_list_src is non-empty and indexable, to avoid a crash / comm mismatch when some rank has None
+                # Assert only when src indices exist on this rank
                 if len(valid_evi_indices_src) > 0 and video_token_indices_list_src is not None and b < len(video_token_indices_list_src):
                     assert len(valid_evi_indices_src) == len(video_token_indices_list_src[b]), f"Sample {b}: valid_evi_indices_src length)"
                     evi_token_indices_list_src.append(valid_evi_indices_src)
                     
-        # step3: compute per-sample, per-time-range video and audio token means
+        # Per-interval video/audio token means
         if vision_audio_hidden_states is not None and video_masks_list is not None and audio_masks_list is not None and (video_token_indices_list is not None or audio_token_indices_list is not None):
             batch_size = len(vision_audio_hidden_states)
 
 
             def _collect_hidden_and_scores_in_range(pure_hidden_states, time_range_indices, pure_scores=None):
-                """Collect hidden_states and scores within one time range. Returns (hidden_tensor, scores_tensor or None); empty ranges return (None, None)."""
+                """Return (hidden, scores or None) for tokens within one time range, or (None, None) if empty."""
                 if time_range_indices is None or (isinstance(time_range_indices, (tuple, list)) and len(time_range_indices) == 0):
                     return (None, None)
-                # Handle a bare single range: with one src/evi this may be (0, 1495); iterating "for start_idx, end_idx in (0,1495)" would fail unpacking 0
+                # Accept a bare (start, end) pair as a single range
                 if isinstance(time_range_indices, (tuple, list)) and len(time_range_indices) == 2 and not isinstance(time_range_indices[0], (tuple, list)):
                     ranges = [tuple(time_range_indices)]
                 else:
@@ -3044,51 +3051,20 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 scores_tensor = torch.cat(scores_in_range, dim=0) if pure_scores is not None and len(scores_in_range) > 0 else None
                 return (hidden_tensor, scores_tensor)
 
-            def compute_multimodal_tokens_mean(pure_video_hidden_states, pure_audio_hidden_states, video_token_indices_list, audio_token_indices_list, b, pure_video_hidden_states_score=None, pure_audio_hidden_states_score=None):
-                """Concatenate the video and audio features of one evi, then softmax-weight/average them jointly to get a single multimodal mean per evi. Returns a list (one mean per evi)."""
-                video_list = (video_token_indices_list[b] if video_token_indices_list is not None and b < len(video_token_indices_list) and video_token_indices_list[b] is not None else [])
-                audio_list = (audio_token_indices_list[b] if audio_token_indices_list is not None and b < len(audio_token_indices_list) and audio_token_indices_list[b] is not None else [])
-                assert len(video_list)==len(audio_list)
-                num_segments = max(len(video_list), len(audio_list))
-                if num_segments == 0:
-                    return None
-                multimodal_means = []
-                for i in range(num_segments):
-                    time_range_v = video_list[i]
-                    time_range_a = audio_list[i]
-                    hidden_v, scores_v = _collect_hidden_and_scores_in_range(pure_video_hidden_states, time_range_v, pure_video_hidden_states_score)
-                    hidden_a, scores_a = _collect_hidden_and_scores_in_range(pure_audio_hidden_states, time_range_a, pure_audio_hidden_states_score)
-                    parts_h = [p for p in [hidden_v, hidden_a] if p is not None]
-                    if len(parts_h) == 0:
-                        multimodal_means.append(None)
-                        continue
-                    combined_hidden = torch.cat(parts_h, dim=0)  # [num_tokens, hidden_size]
-                    has_scores = (scores_v is not None or scores_a is not None)
-                    if has_scores:
-                        parts_s = [p for p in [scores_v, scores_a] if p is not None]
-                        combined_scores = torch.cat(parts_s, dim=0)  # [num_tokens, 1]
-                        combined_scores = F.softmax(combined_scores.squeeze(-1), dim=0).unsqueeze(-1)
-                        mean = torch.sum(combined_hidden * combined_scores, dim=0)
-                    else:
-                        mean = torch.mean(combined_hidden, dim=0)
-                    multimodal_means.append(mean)
-                return multimodal_means
 
-            # Helper: compute token means (supports weighted averaging)
             def compute_token_means(pure_hidden_states, token_indices_list, b, pure_scores=None):
-                """Compute the list of token means for one sample; uses weighted averaging if scores are provided"""
+                """Per-range token means for one sample (softmax-weighted when scores are given)."""
                 if token_indices_list is not None and b < len(token_indices_list) and token_indices_list[b] is not None:
                     means = []
                     for time_range_indices in token_indices_list[b]:
                         if time_range_indices is None or len(time_range_indices) == 0:
                             means.append(None)
                             continue
-                        # Handle a bare single range: with one src/evi this may be (0, 1495); iterating "for start_idx, end_idx in (0,1495)" would fail unpacking 0
+                        # Accept a bare (start, end) pair as a single range
                         if isinstance(time_range_indices, (tuple, list)) and len(time_range_indices) == 2 and not isinstance(time_range_indices[0], (tuple, list)):
                             ranges = [tuple(time_range_indices)]
                         else:
                             ranges = time_range_indices
-                        # Collect hidden states and scores of all tokens within this time range
                         hidden_states_in_range = []
                         scores_in_range = []
                         for start_idx, end_idx in ranges:
@@ -3098,44 +3074,33 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                                 if pure_scores is not None:
                                     scores_in_range.append(pure_scores[start_idx:end_idx])
                         
-                        # Compute the mean for this time range (weighted or simple average)
                         if len(hidden_states_in_range) > 0:
                             hidden_states_tensor = torch.cat(hidden_states_in_range, dim=0)  # [num_tokens, hidden_size]
                             if pure_scores is not None and len(scores_in_range) > 0:
                                 scores_tensor = torch.cat(scores_in_range, dim=0)  # [num_tokens, 1]
-                                # Softmax within the current tgt range, then weight (each range normalized independently)
+                                # Softmax within each range
                                 scores_tensor = F.softmax(scores_tensor.squeeze(-1), dim=0).unsqueeze(-1)  # [num_tokens, 1]
                                 weighted_sum = torch.sum(hidden_states_tensor * scores_tensor, dim=0)  # [hidden_size]
                                 mean = weighted_sum
                             else:
-                                # No scores: use a simple average
                                 mean = torch.mean(hidden_states_tensor, dim=0)
                             means.append(mean)
                         else:
-                            # No tokens found: append None
                             means.append(None)
                 else:
                     return None
                 return means
             
-            # Helper: update evi token embeddings
             def update_evi_embeddings(inputs_embeds, evi_indices, video_means, audio_means, b):
-                """Update evi token embeddings"""
+                """Add video/audio means to the evi token embeddings."""
                 if inputs_embeds is not None and evi_indices is not None and len(evi_indices) > 0:
                     for i, evi_idx in enumerate(evi_indices):
                         if evi_idx < inputs_embeds.shape[1]:
                             if video_means is not None and i < len(video_means) and video_means[i] is not None:
                                 inputs_embeds[b, evi_idx] = inputs_embeds[b, evi_idx] + video_means[i]
                             if audio_means is not None and i < len(audio_means) and audio_means[i] is not None:
-                                inputs_embeds[b, evi_idx] = inputs_embeds[b, evi_idx] + audio_means[i] * getattr(self.config, 'audio_mean_weight', 1.0)
+                                inputs_embeds[b, evi_idx] = inputs_embeds[b, evi_idx] + audio_means[i] * float(getattr(self.config, 'audio_mean_weight', 1.0))
 
-            def update_union_evi_embeddings(inputs_embeds, evi_indices, video_audio_means, b):
-                """Update evi token embeddings"""
-                if inputs_embeds is not None and evi_indices is not None and len(evi_indices) > 0:
-                    for i, evi_idx in enumerate(evi_indices):
-                        if evi_idx < inputs_embeds.shape[1]:
-                            if video_audio_means is not None and i < len(video_audio_means) and video_audio_means[i] is not None:
-                                inputs_embeds[b, evi_idx] = inputs_embeds[b, evi_idx] + video_audio_means[i]
             
             video_token_means_list = []
             audio_token_means_list = []
@@ -3143,12 +3108,10 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             audio_token_means_list_src = []
             
             for b in range(batch_size):
-                # 3.1) get this sample's vision_audio_hidden_states, vision_audio_hidden_states_ori, and optional score
                 batch_vision_audio_hidden = vision_audio_hidden_states[b]  # [vision_token_len, hidden_size]
                 batch_vision_audio_hidden_ori = vision_audio_hidden_states_ori[b]  # [vision_token_len, hidden_size]
                 batch_vision_audio_hidden_score = vision_audio_hidden_states_score[b] if vision_audio_hidden_states_score is not None else None  # [vision_token_len, 1] or None
                 
-                # 3.2) select hidden and initial states (and optional scores) of video/audio tokens using the precomputed masks
                 video_mask = video_masks_list[b]
                 audio_mask = audio_masks_list[b]
                 pure_video_hidden_states = batch_vision_audio_hidden[video_mask]  # [num_video_tokens, hidden_size]
@@ -3158,42 +3121,26 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 if batch_vision_audio_hidden_score is not None:
                     pure_video_hidden_states_score = batch_vision_audio_hidden_score[video_mask]  # [num_video_tokens, 1]
                     pure_audio_hidden_states_score = batch_vision_audio_hidden_score[audio_mask]  # [num_audio_tokens, 1]
-                    # No global softmax over the whole sequence; compute_token_means applies softmax per tgt range instead
                 else:
                     pure_video_hidden_states_score = None
                     pure_audio_hidden_states_score = None
 
-                # 3.3) compute tgt and src video/audio token means (weighted with use_score_head, simple mean otherwise)
+                # tgt means use layer hidden states; src means use input embeddings
 
-                if getattr(self.config, 'union_aggregation'):
-                    sample_multimodal_means = compute_multimodal_tokens_mean(pure_video_hidden_states, pure_audio_hidden_states, video_token_indices_list, audio_token_indices_list, b, pure_video_hidden_states_score, pure_audio_hidden_states_score)
-                    sample_multimodal_means_src = compute_multimodal_tokens_mean(pure_video_hidden_states_ori, pure_audio_hidden_states_ori, video_token_indices_list_src, audio_token_indices_list_src, b, None, None) if (video_token_indices_list_src and len(video_token_indices_list_src) > 0 and b < len(video_token_indices_list_src)) else []
-                    # 3.4) update tgt and src evi token embeddings (add the mean feature onto the evi)
-                    if evi_token_indices_list is not None and b < len(evi_token_indices_list):
-                        update_union_evi_embeddings(inputs_embeds, evi_token_indices_list[b], sample_multimodal_means, b)
-                    if evi_token_indices_list_src is not None and b < len(evi_token_indices_list_src):
-                        update_union_evi_embeddings(inputs_embeds, evi_token_indices_list_src[b], sample_multimodal_means_src, b)
-                else:
-
-                    sample_video_means = compute_token_means(pure_video_hidden_states, video_token_indices_list, b, pure_video_hidden_states_score)
-                    sample_audio_means = compute_token_means(pure_audio_hidden_states, audio_token_indices_list, b, pure_audio_hidden_states_score)
-                    sample_video_means_src = compute_token_means(pure_video_hidden_states_ori, video_token_indices_list_src, b, None) if video_token_indices_list_src and len(video_token_indices_list_src) > 0 and b < len(video_token_indices_list_src) else None
-                    sample_audio_means_src = compute_token_means(pure_audio_hidden_states_ori, audio_token_indices_list_src, b, None) if audio_token_indices_list_src and len(audio_token_indices_list_src) > 0 and b < len(audio_token_indices_list_src) else None
+                sample_video_means = compute_token_means(pure_video_hidden_states, video_token_indices_list, b, pure_video_hidden_states_score)
+                sample_audio_means = compute_token_means(pure_audio_hidden_states, audio_token_indices_list, b, pure_audio_hidden_states_score)
+                sample_video_means_src = compute_token_means(pure_video_hidden_states_ori, video_token_indices_list_src, b, None) if video_token_indices_list_src and len(video_token_indices_list_src) > 0 and b < len(video_token_indices_list_src) else None
+                sample_audio_means_src = compute_token_means(pure_audio_hidden_states_ori, audio_token_indices_list_src, b, None) if audio_token_indices_list_src and len(audio_token_indices_list_src) > 0 and b < len(audio_token_indices_list_src) else None
                     
-                    video_token_means_list.append(sample_video_means)   # returned but unused downstream
-                    audio_token_means_list.append(sample_audio_means)   # returned but unused downstream
-                    video_token_means_list_src.append(sample_video_means_src)   # returned but unused downstream
-                    audio_token_means_list_src.append(sample_audio_means_src)   # returned but unused downstream
+                video_token_means_list.append(sample_video_means)
+                audio_token_means_list.append(sample_audio_means)
+                video_token_means_list_src.append(sample_video_means_src)
+                audio_token_means_list_src.append(sample_audio_means_src)
 
-                    # 3.4) update tgt and src evi token embeddings (handled uniformly)
-                    if evi_token_indices_list is not None and b < len(evi_token_indices_list):
-                        update_evi_embeddings(inputs_embeds, evi_token_indices_list[b], sample_video_means, sample_audio_means, b)
-                    if evi_token_indices_list_src is not None and b < len(evi_token_indices_list_src):
-                        update_evi_embeddings(inputs_embeds, evi_token_indices_list_src[b], sample_video_means_src, sample_audio_means_src, b)
-        
-        score_head_dummy = None
-        if vision_audio_hidden_states_score is not None and len(vision_audio_hidden_states_score) > 0:
-            score_head_dummy = sum(t.sum() for t in vision_audio_hidden_states_score)
+                if evi_token_indices_list is not None and b < len(evi_token_indices_list):
+                    update_evi_embeddings(inputs_embeds, evi_token_indices_list[b], sample_video_means, sample_audio_means, b)
+                if evi_token_indices_list_src is not None and b < len(evi_token_indices_list_src):
+                    update_evi_embeddings(inputs_embeds, evi_token_indices_list_src[b], sample_video_means_src, sample_audio_means_src, b)
         
         return (
             vision_audio_hidden_states,
@@ -3204,7 +3151,6 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             video_token_means_list,
             audio_token_means_list,
             inputs_embeds,
-            score_head_dummy,
         )
 
     def _compute_vision_info_per_timestep(
@@ -3218,10 +3164,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         video_token_indices_per_timestep: list,
         audio_token_indices_per_timestep: list,
     ) -> torch.Tensor:
-        """
-        Using per-timestep video/audio token indices, average the corresponding hidden states
-        over the vision sequence to obtain per-timestep vision info (video + audio_mean_weight * audio).
-        """
+        """Per-timestep features [num_timesteps, hidden]: mean video tokens + audio_mean_weight * mean audio tokens."""
         start_pos = vision_start_positions[b].item() + 1
         end_pos = vision_end_positions[b].item()
         vision_input_ids = input_ids[b, start_pos:end_pos]
@@ -3260,10 +3203,10 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 return None
             return torch.cat(indices_list, dim=0)
 
-        num_ts = max(num_timesteps, len(vid_per_ts), len(aud_per_ts))   # the three should be equal in theory
+        num_ts = max(num_timesteps, len(vid_per_ts), len(aud_per_ts))
         video_timestep_means = []
         audio_timestep_means = []
-        for t in range(num_ts): # iterate over timesteps; each timestep yields one mean feature of video+audio
+        for t in range(num_ts):
             v_ranges = vid_per_ts[t] if t < len(vid_per_ts) else []
             a_ranges = aud_per_ts[t] if t < len(aud_per_ts) else []
             vid_idx = ranges_to_vision_indices(v_ranges, video_positions, n_video)
@@ -3275,7 +3218,8 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         video_timestep_means_tensor = torch.stack(video_timestep_means, dim=0)
         audio_timestep_means_tensor = torch.stack(audio_timestep_means, dim=0)
         aw = getattr(self.config, 'audio_mean_weight', 1.0)
-        return video_timestep_means_tensor + aw * audio_timestep_means_tensor
+        info = video_timestep_means_tensor + aw * audio_timestep_means_tensor   # [num_timesteps, hidden]
+        return info
 
 
     def _get_timestep_token_ranges_from_per_timestep(
@@ -3288,13 +3232,10 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         video_token_indices_per_timestep: list,
         audio_token_indices_per_timestep: list,
     ) -> list:
-        """
-        Convert per-timestep video/audio indices into per-timestep token indices in the vision
-        sequence, so generating can average tokens from cache_img_state over tgt timestep ranges.
+        """Map per-timestep video/audio ranges to token indices within the vision segment.
 
         Returns:
-            list of length num_timesteps; each element is (v_idx, a_idx), where
-            v_idx/a_idx are index LongTensors into the vision segment (or None if the step has no video/audio).
+            List of num_timesteps (v_idx, a_idx) LongTensor pairs (None when a step has no such tokens).
         """
         start_pos = vision_start_positions[b].item() + 1
         end_pos = vision_end_positions[b].item()
@@ -3306,11 +3247,10 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         n_video, n_audio = video_positions.numel(), audio_positions.numel()
 
         def _ranges_to_vision_indices(ranges, positions, max_len):
-            """Convert per-timestep (s,e) ranges (in video/audio token index space) to an index tensor into the vision segment."""
+            """(s, e) ranges in video/audio token space -> index tensor into the vision segment."""
             if not ranges:
                 return None
             idx_list = []
-            # A timestep's ranges may be [(s,e), ...] or a single (s,e)
             if isinstance(ranges, (tuple, list)) and len(ranges) == 2 and not isinstance(ranges[0], (tuple, list)):
                 ranges = [tuple(ranges)]
             for r in ranges:
@@ -3347,14 +3287,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         position_ids: torch.Tensor,
         num_timesteps: int,
     ) -> list:
-        """
-        Return each timestep's video/audio token index ranges in the vision sequence
-        (used to average tokens from cache_img_state per timestep range).
-
-        Returns:
-            list of length num_timesteps; each element is ((v_start, v_end), (a_start, a_end))
-            in vision-sequence indices (consistent with the row indices of cache_img_state[b]).
-        """
+        """Per-timestep ((v_start, v_end), (a_start, a_end)) token ranges within the vision segment."""
         start_pos = vision_start_positions[b].item() + 1
         end_pos = vision_end_positions[b].item()
         vision_input_ids = input_ids[b, start_pos:end_pos]
@@ -3379,6 +3312,168 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             a_start, a_end = (audio_ts.min().item(), audio_ts.max().item() + 1) if audio_ts.numel() > 0 else (0, 0)
             timestep_ranges.append(((v_start, v_end), (a_start, a_end)))
         return timestep_ranges
+
+    @torch.no_grad()
+    def _self_aggregation_indices(
+        self,
+        input_ids,
+        inputs_embeds,
+        position_ids,
+        attention_mask,
+        cache_position,
+        vision_start_positions,
+        vision_end_positions,
+        hidden_states_part1,
+        input_ids_part1,
+        labels,
+        tgt,
+        video_token_indices_list,
+        audio_token_indices_list,
+        video_token_indices_list_src,
+        audio_token_indices_list_src,
+        video_token_indices_per_timestep,
+        audio_token_indices_per_timestep,
+        tgt_timestep_distances,
+        event_id,
+        last_text_to_vision_attn_maps,
+    ):
+        """Scheduled sampling: replace GT aggregation intervals with the model's own readouts.
+
+        Runs a no-grad probe forward, reads out each planning <G> interval as at inference, and
+        substitutes those ranges (anchors reuse their planning readout; empty readouts keep GT).
+
+        Returns:
+            (video_token_indices_list, audio_token_indices_list) with entries replaced.
+        """
+        # Probe forward with GT aggregation
+        probe_embeds = inputs_embeds.clone()
+        (_, _, _, _, _, _, _, probe_embeds) = self._prepare_second_forward_pass(
+            vision_start_positions=vision_start_positions,
+            vision_end_positions=vision_end_positions,
+            hidden_states_part1=hidden_states_part1,
+            input_ids_part1=input_ids_part1,
+            input_ids=input_ids,
+            labels=labels,
+            tgt=tgt,
+            video_token_indices_list=video_token_indices_list,
+            audio_token_indices_list=audio_token_indices_list,
+            video_token_indices_list_src=video_token_indices_list_src,
+            audio_token_indices_list_src=audio_token_indices_list_src,
+            inputs_embeds=probe_embeds,
+            last_text_to_vision_attn_maps=last_text_to_vision_attn_maps,
+        )
+        probe_out = self.model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            inputs_embeds=probe_embeds,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+            cache_position=cache_position,
+            vision_start_positions=vision_start_positions,
+            vision_end_positions=vision_end_positions,
+            event_id=event_id,
+            output_hidden_states_layer_index=-2 if getattr(self.config, 'save_gpu_trick') else None,
+        )
+        evi_all = self.evi_head(probe_out.hidden_states[-2])
+        frm_all = self.frm_head(probe_out.hidden_states[-2])
+        # Read out like inference, including boundary snapping
+        _snap_on = int(getattr(self.config, 'grounding_snap_window', 0) or 0) > 0 and getattr(self.config, 'grounding_boundary_heads', False)
+        _hid_all = probe_out.hidden_states[-2]
+        bnd_all = self.bnd_frm_head(_hid_all) if _snap_on else None
+        evi_id = self.config.evi_token_id
+
+        def _flatten_ranges(per_ts, t0, t1):
+            """Concatenate the per-timestep (s, e) token ranges over timesteps [t0, t1]."""
+            out = []
+            for t in range(max(0, int(t0)), min(int(t1) + 1, len(per_ts))):
+                r = per_ts[t]
+                if not r:
+                    continue
+                if isinstance(r, (tuple, list)) and len(r) == 2 and not isinstance(r[0], (tuple, list)):
+                    out.append(tuple(r))
+                else:
+                    out.extend(tuple(x) for x in r)
+            return out
+
+        new_video = [list(x) if x is not None else None for x in video_token_indices_list]
+        new_audio = ([list(x) if x is not None else None for x in audio_token_indices_list]
+                     if audio_token_indices_list is not None else None)
+        for b in range(input_ids.shape[0]):
+            if (new_video[b] is None or len(new_video[b]) == 0
+                    or tgt_timestep_distances is None or b >= len(tgt_timestep_distances)
+                    or tgt_timestep_distances[b] is None or len(tgt_timestep_distances[b]) == 0):
+                continue
+            n_entries = len(new_video[b])
+            evi_positions = (input_ids[b] == evi_id).nonzero(as_tuple=True)[0]
+            if evi_positions.numel() != n_entries:
+                continue  # unexpected <G> layout: keep GT
+            K = (event_id[b].max().item() + 1
+                 if event_id is not None and event_id[b] is not None else n_entries)
+            num_ts = len(tgt_timestep_distances[b][0])
+            frm_vision = frm_all[b, vision_start_positions[b].item() + 1:vision_end_positions[b].item()]
+            vision_info = self._compute_vision_info_per_timestep(
+                b=b,
+                vision_start_positions=vision_start_positions,
+                vision_end_positions=vision_end_positions,
+                input_ids=input_ids,
+                frm_vision_tokens=frm_vision,
+                num_timesteps=num_ts,
+                video_token_indices_per_timestep=video_token_indices_per_timestep or [],
+                audio_token_indices_per_timestep=audio_token_indices_per_timestep or [],
+            )  # [num_timesteps, hidden_size]
+            bnd_info = None
+            if _snap_on:
+                bnd_info = self._compute_vision_info_per_timestep(
+                    b=b, vision_start_positions=vision_start_positions, vision_end_positions=vision_end_positions,
+                    input_ids=input_ids, frm_vision_tokens=bnd_all[b, vision_start_positions[b].item() + 1:vision_end_positions[b].item()],
+                    num_timesteps=num_ts, video_token_indices_per_timestep=video_token_indices_per_timestep or [],
+                    audio_token_indices_per_timestep=audio_token_indices_per_timestep or [])
+            vid_per_ts = (video_token_indices_per_timestep[b]
+                          if video_token_indices_per_timestep is not None
+                          and b < len(video_token_indices_per_timestep)
+                          and video_token_indices_per_timestep[b] is not None else [])
+            aud_per_ts = (audio_token_indices_per_timestep[b]
+                          if audio_token_indices_per_timestep is not None
+                          and b < len(audio_token_indices_per_timestep)
+                          and audio_token_indices_per_timestep[b] is not None else [])
+            # Coverage mask as at inference: zero timesteps claimed by earlier events
+            use_cov = bool(getattr(self.config, 'grounding_coverage_mask', False))
+            claimed = torch.zeros(vision_info.shape[0], dtype=torch.bool, device=vision_info.device)
+            for i in range(K):
+                ev = evi_all[b, evi_positions[i].item()].unsqueeze(0)
+                sim = torch.sigmoid(torch.matmul(ev, vision_info.t()) / (ev.size(1) ** 0.5))
+                if use_cov and claimed.any():
+                    masked = torch.where(claimed.unsqueeze(0), torch.zeros_like(sim), sim)
+                    if masked.max().item() > 0:
+                        sim = masked
+                pred = self.find_and_merge(sim)
+                if pred and bnd_info is not None:
+                    ss, se = self._boundary_sims(_hid_all[b, evi_positions[i].item()], bnd_info)
+                    pred = self._snap_readout(pred, ss, se)
+                if not pred:
+                    continue  # empty readout: keep GT
+                t0, t1 = pred[0]
+                if use_cov:
+                    claimed[max(0, int(t0)):min(claimed.shape[0], int(t1) + 1)] = True
+                if b == 0 and i == 0 and not getattr(self, '_self_agg_logged', False):
+                    self._self_agg_logged = True
+                    print(f"[self_agg] triggered: readout threshold={getattr(self.config, 'grounding_threshold', 0.8)} "
+                          f"merge_gap={getattr(self.config, 'grounding_merge_gap', 2)} coverage_mask={use_cov} K={K}")
+                v_ranges = _flatten_ranges(vid_per_ts, t0, t1)
+                a_ranges = _flatten_ranges(aud_per_ts, t0, t1)
+                if v_ranges:
+                    new_video[b][i] = v_ranges
+                    if n_entries == 2 * K:
+                        new_video[b][K + i] = v_ranges  # anchor reuses the planning readout
+                if new_audio is not None and new_audio[b] is not None and a_ranges:
+                    new_audio[b][i] = a_ranges
+                    if len(new_audio[b]) == 2 * K:
+                        new_audio[b][K + i] = a_ranges
+        return new_video, new_audio
 
     def evi_forward(
         self,
@@ -3406,6 +3501,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         video_grid_thw: Optional[torch.LongTensor] = None,
         event_id: Optional[torch.LongTensor] = None,
         parallel_start_idx: Optional[torch.LongTensor] = None,
+        task: Optional[list] = None,
         audio_lengths: Optional[list] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
         last_text_token_indices: Optional[torch.LongTensor] = None,
@@ -3414,9 +3510,6 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         if self.training:
             ########################################################################## Prepare the first forward pass
             use_attention_head = getattr(self.config, 'use_attention_head', False)
-            # Default: recompute the attention row via hook in O(L*d); use_legacy_attn_row=True falls back to full-layer output_attentions materialization (for parity checks / fallback)
-            use_legacy_attn_row = getattr(self.config, 'use_legacy_attn_row', False)
-            output_attentions = True if (use_attention_head and use_legacy_attn_row) else output_attentions
             (
                 input_ids_part1,
                 inputs_embeds_part1,
@@ -3432,10 +3525,10 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 position_ids=position_ids,
                 last_text_token_indices=last_text_token_indices,
             )
-            ########################################################################## First forward pass (only the target layer's attention / hidden_states, saving memory)
+            ########################################################################## First forward pass (prefix up to the vision span / question)
             vision_audio_layer_index = getattr(self.config, 'vision_audio_layer_index', None)
             attn_row_handle, attn_row_storage = None, None
-            if use_attention_head and not use_legacy_attn_row and vision_audio_layer_index is not None:
+            if use_attention_head and vision_audio_layer_index is not None:
                 attn_row_handle, attn_row_storage = self._register_attn_row_capture(vision_audio_layer_index)
             outputs_part1 = self.model(
                 input_ids=None,
@@ -3451,28 +3544,48 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 vision_start_positions=vision_start_positions,
                 vision_end_positions=vision_end_positions,
                 event_id=None,
-                output_attentions_layer_index=vision_audio_layer_index if (use_attention_head and use_legacy_attn_row and getattr(self.config, 'save_gpu_trick')) else None,
                 output_hidden_states_layer_index=vision_audio_layer_index if getattr(self.config, 'save_gpu_trick') else None,
             )
             if attn_row_handle is not None:
                 attn_row_handle.remove()
             ########################################################################## Prepare the second forward pass
             if use_attention_head and last_text_token_indices is not None and vision_audio_layer_index is not None:
-                if use_legacy_attn_row:
-                    # Legacy path: full-layer attention materialization [B, num_heads, L, L] (O(L^2) memory), for parity checks / fallback only
-                    attn = outputs_part1.attentions[vision_audio_layer_index]
-                    batch_size = attn.shape[0]
-                    last_text_token_indices_local = last_text_token_indices.to(device=attn.device).squeeze(-1)  # slice by last text token first, then average over heads
-                    attn_sliced = attn[torch.arange(batch_size, device=attn.device), :, last_text_token_indices_local, :]  # [B, num_heads, L]
-                    last_text_to_vision_attn_maps = attn_sliced.mean(dim=1).unsqueeze(-1)  # [B, seq_len, 1]
-                else:
-                    # New path: recompute the target row in O(L*d) from the hook-captured layer input
-                    last_text_to_vision_attn_maps = self._attn_row_from_capture(attn_row_storage, last_text_token_indices, vision_audio_layer_index)
-                    batch_size = last_text_to_vision_attn_maps.shape[0]
+                last_text_to_vision_attn_maps = self._attn_row_from_capture(attn_row_storage, last_text_token_indices, vision_audio_layer_index)
+                batch_size = last_text_to_vision_attn_maps.shape[0]
             else:
                 last_text_to_vision_attn_maps = None
                 batch_size = attention_mask.shape[0]
             
+            # Scheduled sampling of aggregation intervals (see _self_aggregation_indices)
+            self_agg_prob = getattr(self.config, 'self_aggregation_prob', 0.0) or 0.0
+            if (self_agg_prob > 0 and tgt is not None
+                    and video_token_indices_list is not None
+                    and video_token_indices_per_timestep is not None
+                    and tgt_timestep_distances is not None
+                    and torch.rand(1).item() < self_agg_prob):
+                video_token_indices_list, audio_token_indices_list = self._self_aggregation_indices(
+                    input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    vision_start_positions=vision_start_positions,
+                    vision_end_positions=vision_end_positions,
+                    hidden_states_part1=outputs_part1['hidden_states'],
+                    input_ids_part1=input_ids_part1,
+                    labels=labels,
+                    tgt=tgt,
+                    video_token_indices_list=video_token_indices_list,
+                    audio_token_indices_list=audio_token_indices_list,
+                    video_token_indices_list_src=video_token_indices_list_src,
+                    audio_token_indices_list_src=audio_token_indices_list_src,
+                    video_token_indices_per_timestep=video_token_indices_per_timestep,
+                    audio_token_indices_per_timestep=audio_token_indices_per_timestep,
+                    tgt_timestep_distances=tgt_timestep_distances,
+                    event_id=event_id,
+                    last_text_to_vision_attn_maps=last_text_to_vision_attn_maps,
+                )
+
             (
                 vision_audio_hidden_states,
                 video_masks_list,
@@ -3482,7 +3595,6 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 video_token_means_list,
                 audio_token_means_list,
                 inputs_embeds,
-                score_head_dummy,
             ) = self._prepare_second_forward_pass(
                 vision_start_positions=vision_start_positions,
                 vision_end_positions=vision_end_positions,
@@ -3499,7 +3611,18 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 last_text_to_vision_attn_maps=last_text_to_vision_attn_maps,
             )
 
-            ########################################################################## Second forward pass (only layer -2 hidden_states, saving memory)
+            ########################################################################## Second forward pass
+            event_vision_visible = None
+            if getattr(self.config, 'branch_interval_attention', False) and event_id is not None:
+                event_vision_visible = self._build_event_vision_visibility_train(
+                    input_ids=input_ids,
+                    vision_start_positions=vision_start_positions,
+                    vision_end_positions=vision_end_positions,
+                    event_id=event_id,
+                    tgt_timestep_distances=tgt_timestep_distances,
+                    video_token_indices_per_timestep=video_token_indices_per_timestep or [],
+                    audio_token_indices_per_timestep=audio_token_indices_per_timestep or [],
+                )
             outputs = self.model(
                 input_ids=None,
                 position_ids=position_ids,
@@ -3514,6 +3637,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 vision_start_positions=vision_start_positions,
                 vision_end_positions=vision_end_positions,
                 event_id=event_id,
+                event_vision_visible=event_vision_visible,
                 output_hidden_states_layer_index=-2 if getattr(self.config, 'save_gpu_trick') else None,
             )
             ########################################################################## Compute loss
@@ -3522,7 +3646,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             loss = None
             logits = None
 
-            # The if-block below builds the output labels (a plain shift of the input is not enough)
+            # Build output labels: insert <S> and drop anchor <G> tokens for dvc samples
             if shift_labels is None:
                 if event_id is not None:
                     new_labels_list = []
@@ -3533,20 +3657,15 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                             new_labels_list.append(nn.functional.pad(labels[b], (0, 1), value=-100))
                             continue
 
-                        # 1) number of tokens to delete (= number of events): the input contains two rounds of evi
-                        #    but the output has only one, so the second round is removed when building labels
+                        # Number of anchor <G> tokens to drop (= number of events)
                         num_deleted_tokens = event_id[b].max().item() + 1
                         event_num.append(num_deleted_tokens)
 
-                        # 2) start index of the deleted tokens
                         deleted_token_start_index = parallel_start_idx[b].item()
 
-                        # 3) Insert the <S> token at the start index (the switch signal S in the paper marking the end
-                        #    of planning; it exists only in labels, never in the input sequence, which teaches the model to
-                        #    emit <S> at the end of the serial block), delete num_deleted_tokens anchor evi tokens starting
-                        #    at that index (anchors are input-only, never predicted), and pad on the right
+                        # Insert <S> (label-only end-of-planning signal), drop the input-only anchors, right-pad
                         insert_token = torch.tensor([self.config.evi_end_token_id], device=labels.device, dtype=labels.dtype)
-                        pad_length = max(0, num_deleted_tokens - 1) + 1 # the +1 matches the standard case, since labels are shifted by one
+                        pad_length = max(0, num_deleted_tokens - 1) + 1 # +1 for the label shift
                         pad_tensor = torch.full((pad_length,), -100, device=labels.device, dtype=labels.dtype)
                         labels_b = torch.cat([
                             labels[b, :deleted_token_start_index],
@@ -3560,34 +3679,59 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     labels = nn.functional.pad(labels, (0, 1), value=-100)
                 shift_labels = labels[..., 1:].contiguous()
 
-            frm_tokens_all = self.frm_head(outputs.hidden_states[-2])   # process all tokens at once, easier with batching
+            frm_tokens_all = self.frm_head(outputs.hidden_states[-2])
             evi_tokens_all = self.evi_head(outputs.hidden_states[-2])
                 
             
             batch_size = frm_tokens_all.shape[0]
-            # Initialize as torch.Tensor to keep the type consistent (even when the value is 0)
             device = frm_tokens_all.device
             dtype = frm_tokens_all.dtype
             loss_match = torch.tensor(0.0, device=device, dtype=dtype)
             avg_factor = 0
+            # fp32 accumulators so small per-sample terms are not rounded away
+            loss_contrast = torch.tensor(0.0, device=device, dtype=torch.float32)
+            contrast_factor = 0
+            loss_iou = torch.tensor(0.0, device=device, dtype=torch.float32)
+            iou_factor = 0
+            # Boundary-head per-timestep projection
+            bnd_w_loss = float(getattr(self.config, 'loss_boundary_weight', 0.0) or 0.0)
+            bnd_hidden = outputs.hidden_states[-2]
+            bnd_frm_tokens_all = self.bnd_frm_head(bnd_hidden) if bnd_w_loss > 0 else None
+            loss_bnd = torch.tensor(0.0, device=device, dtype=torch.float32)
+            bnd_factor = 0
+            # Optional plateau and boundary-rank losses (see _plateau_loss / _boundary_loss)
+            plateau_w = float(getattr(self.config, 'loss_plateau_weight', 0.0) or 0.0)
+            rank_w = float(getattr(self.config, 'loss_boundary_rank_weight', 0.0) or 0.0)
+            loss_plateau = torch.tensor(0.0, device=device, dtype=torch.float32); plateau_factor = 0
+            loss_rank = torch.tensor(0.0, device=device, dtype=torch.float32); rank_factor = 0
             for b in range(batch_size):
-                # step1: get audio + video tokens
                 frm_vision_tokens = frm_tokens_all[b, vision_start_positions[b].item()+1:vision_end_positions[b].item()]  # [vision_token_len, hidden_size]
 
-                # step2: read GT time distances and compute GT similarity
-                # Check whether tgt_timestep_distances is empty
+                # GT soft targets from timestep distances
                 if (tgt_timestep_distances is not None 
                     and b < len(tgt_timestep_distances) 
                     and tgt_timestep_distances[b] is not None 
                     and len(tgt_timestep_distances[b]) > 0):
                     tgt_timestep_distances_b = torch.tensor(tgt_timestep_distances[b],dtype=torch.float32,device=frm_tokens_all.device)
                     if event_id is not None and event_id[b] is not None:
-                        # dvc only: tgt is mirrored (planning + anchors), so keep the first event_num
-                        # entries. Single-event tasks store the interval once and need no truncation.
+                        # dvc: tgt is mirrored (planning + anchors); keep the first event_num rows
                         tgt_timestep_distances_b = tgt_timestep_distances_b[:event_num[b]]
-                    sim_tgt = torch.pow(0.5, tgt_timestep_distances_b)  # [num_time_intervals, num_timesteps]
+                    # Soft target 0.5^(decay * distance); larger decay gives sharper edges
+                    tgt_decay = getattr(self.config, 'grounding_target_decay', 1.0) or 1.0
+                    sim_tgt = torch.pow(0.5, tgt_timestep_distances_b * tgt_decay)  # [num_time_intervals, num_timesteps]
 
-                    # step3: compute vision info from per-timestep video/audio indices
+                    # Coverage-consistent grounding (dvc only): mask timesteps already claimed by earlier events,
+                    # matching the inference-time coverage mask.
+                    cov_w = None
+                    if getattr(self.config, 'grounding_coverage_train', False) and sim_tgt.shape[0] > 1:
+                        inside = (tgt_timestep_distances_b == 0).float()          # [K, num_ts]
+                        claimed = (torch.cumsum(inside, dim=0) - inside) > 0      # events strictly before j
+                        cov_w = (~claimed).to(sim_tgt.dtype)
+                        if (cov_w.sum(dim=1) == 0).any():
+                            cov_w = None                                          # degenerate layout: stay unrestricted
+                    ew = cov_w
+
+                    # Per-timestep vision features
                     vision_info_tensor = self._compute_vision_info_per_timestep(
                         b=b,
                         vision_start_positions=vision_start_positions,
@@ -3599,18 +3743,76 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                         audio_token_indices_per_timestep=audio_token_indices_per_timestep or [],
                     )  # [num_timesteps, hidden_size]
                     
-                    # step4: compute the similarity loss
+                    # Grounding (match) loss
                     inds = torch.where(shift_labels[b] == self.config.evi_token_id)[0]
-                    if len(inds) > 0:  # only compute the loss when evi tokens exist
+                    if len(inds) > 0:
                         evi_tokens = evi_tokens_all[b][inds]  # [num_evi_tokens, hidden_size]
                         sim_pred = torch.matmul(evi_tokens, vision_info_tensor.t()) / (evi_tokens.size(1) ** 0.5)  # [num_evi_tokens, num_timesteps]
-                        # sim_pred = torch.sigmoid(sim_pred)  
 
-                        loss_match = loss_match + F.binary_cross_entropy_with_logits(sim_pred, sim_tgt)
+                        if ew is not None:
+                            bce = F.binary_cross_entropy_with_logits(sim_pred, sim_tgt, reduction='none')
+                            loss_match = loss_match + (bce * ew).sum() / ew.sum()
+                        else:
+                            loss_match = loss_match + F.binary_cross_entropy_with_logits(sim_pred, sim_tgt)
                         avg_factor += 1
 
-            # The LM loss is computed once outside the for loop, not per sample
-            # (computing it inside the loop would only reflect the last sample)
+                        if plateau_w > 0:
+                            l_p = self._plateau_loss(sim_pred, tgt_timestep_distances_b, cov_w)
+                            if l_p is not None:
+                                loss_plateau = loss_plateau + l_p; plateau_factor += 1
+                        if bnd_frm_tokens_all is not None:
+                            l_b = self._boundary_loss(
+                                b, inds, bnd_hidden, bnd_frm_tokens_all, tgt_timestep_distances_b,
+                                vision_start_positions, vision_end_positions, input_ids,
+                                video_token_indices_per_timestep or [], audio_token_indices_per_timestep or [])
+                            if l_b is not None:
+                                loss_bnd = loss_bnd + l_b
+                                bnd_factor += 1
+                                if rank_w > 0 and getattr(self, '_last_bnd_rank', None) is not None:
+                                    loss_rank = loss_rank + self._last_bnd_rank; rank_factor += 1
+                                self._last_bnd_rank = None
+
+                        # Optional soft temporal IoU loss
+                        if (getattr(self.config, 'loss_iou_weight', 0.0) or 0.0) > 0:
+                            l_iou = self._soft_iou_loss(sim_pred, sim_tgt, cov_w)
+                            if l_iou is not None:
+                                loss_iou = loss_iou + l_iou
+                                iou_factor += 1
+
+                        # Optional timestep InfoNCE: in-interval timesteps should outscore the rest
+                        contrast_w = getattr(self.config, 'loss_contrast_weight', 0.0) or 0.0
+                        if contrast_w > 0:
+                            tau = getattr(self.config, 'loss_contrast_tau', 0.1)
+                            pos_mask = sim_tgt >= 0.999
+                            valid = pos_mask.any(dim=1) & (~pos_mask).any(dim=1)
+                            if valid.any():
+                                if getattr(self.config, 'loss_contrast_detach', True):
+                                    # Heads-only gradient: detach backbone hidden states
+                                    hidden_d = outputs.hidden_states[-2][b].detach()
+                                    evi_c = self.evi_head(hidden_d)[inds]
+                                    frm_vision_c = self.frm_head(hidden_d)[
+                                        vision_start_positions[b].item() + 1:vision_end_positions[b].item()]
+                                    vision_info_c = self._compute_vision_info_per_timestep(
+                                        b=b,
+                                        vision_start_positions=vision_start_positions,
+                                        vision_end_positions=vision_end_positions,
+                                        input_ids=input_ids,
+                                        frm_vision_tokens=frm_vision_c,
+                                        num_timesteps=tgt_timestep_distances_b.shape[1],
+                                        video_token_indices_per_timestep=video_token_indices_per_timestep or [],
+                                        audio_token_indices_per_timestep=audio_token_indices_per_timestep or [],
+                                    )
+                                    sim_c = torch.matmul(evi_c, vision_info_c.t()) / (evi_c.size(1) ** 0.5)
+                                else:
+                                    sim_c = sim_pred
+                                logits_c = (sim_c[valid] / tau).float()
+                                lse_all = torch.logsumexp(logits_c, dim=1)
+                                lse_pos = torch.logsumexp(
+                                    logits_c.masked_fill(~pos_mask[valid], float('-inf')), dim=1)
+                                loss_contrast = loss_contrast + (lse_all - lse_pos).mean()
+                                contrast_factor += 1
+
+            # LM loss over the whole batch
             if labels is not None or shift_labels is not None:
                 loss = LigerForCausalLMLoss(
                     hidden_states=hidden_states,
@@ -3621,22 +3823,48 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     **loss_kwargs,
                 )
             else:
-                # No labels: loss stays None (inference mode)
                 loss = None
 
+            # Upweight <S> to loss_stop_weight x a normal token. Keep this term normalized by
+            # n_supervised, otherwise planning collapses to a single event.
+            loss_stop_weight = getattr(self.config, 'loss_stop_weight', 0.0) or 0.0
+            if loss is not None and loss_stop_weight > 1 and shift_labels is not None:
+                stop_mask = shift_labels == self.config.evi_end_token_id  # [B, L]
+                # Symmetric variant: also upweight dvc planning <G> ("continue") positions
+                if getattr(self.config, 'loss_stop_symmetric', False) and event_id is not None:
+                    dvc_rows = torch.tensor([event_id[b] is not None for b in range(shift_labels.shape[0])],
+                                            device=shift_labels.device, dtype=torch.bool)
+                    if dvc_rows.any():
+                        stop_mask = stop_mask | ((shift_labels == self.config.evi_token_id)
+                                                 & dvc_rows.unsqueeze(1))
+                n_supervised = (shift_labels != -100).sum()
+                if stop_mask.any() and n_supervised > 0:
+                    stop_hidden = hidden_states[stop_mask]  # [n_stop, hidden_size]
+                    stop_logits = self.lm_head(stop_hidden.to(self.lm_head.weight.dtype)).float()
+                    stop_targets = shift_labels[stop_mask]
+                    stop_ce_sum = F.cross_entropy(stop_logits, stop_targets, reduction='sum')
+                    loss = loss + (loss_stop_weight - 1.0) * stop_ce_sum / n_supervised
+
             if loss is not None:
-                # Distributed training: keep frm_head/evi_head/score_head in the computation graph on all ranks.
-                # When step3 is skipped (e.g. this rank's batch has no video/audio_token_indices), score_head does not
-                # flow into the loss through inputs_embeds; attaching (score_head_dummy * 0) to the loss avoids
-                # DDP/DeepSpeed communication mismatches from ranks not backpropagating score_head.
+                # Zero-weight terms keep the grounding heads in the graph on every rank (DDP sync)
                 dummy_terms = (frm_tokens_all.sum() + evi_tokens_all.sum()) * 0
-                if score_head_dummy is not None:
-                    dummy_terms = dummy_terms + score_head_dummy * 0
+                if bnd_frm_tokens_all is not None:
+                    dummy_terms = dummy_terms + bnd_frm_tokens_all.sum() * 0 + sum(p.sum() for p in self.bnd_evi_head.parameters()) * 0
                 if avg_factor > 0:
                     loss_match_weight = getattr(self.config, 'loss_match_weight', 3.0)
                     loss = loss + (loss_match / avg_factor) * loss_match_weight + dummy_terms
                 else:
                     loss = loss + dummy_terms + loss_match * 0
+                if contrast_factor > 0:
+                    loss = loss + (loss_contrast / contrast_factor) * getattr(self.config, 'loss_contrast_weight', 0.0)
+                if iou_factor > 0:
+                    loss = loss + (loss_iou / iou_factor) * getattr(self.config, 'loss_iou_weight', 0.0)
+                if bnd_factor > 0:
+                    loss = loss + (loss_bnd / bnd_factor) * bnd_w_loss
+                if plateau_factor > 0:
+                    loss = loss + (loss_plateau / plateau_factor) * plateau_w
+                if rank_factor > 0:
+                    loss = loss + (loss_rank / rank_factor) * rank_w
 
             return Qwen2_5_VLCausalLMOutputWithPast(
                 loss=loss,
@@ -3649,15 +3877,13 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             )
         else:
             use_attention_head = getattr(self.config, 'use_attention_head', False)
-            use_legacy_attn_row = getattr(self.config, 'use_legacy_attn_row', False)
-            output_attentions = True if (use_attention_head and use_legacy_attn_row) else output_attentions
             cache_len = (
                 0 if past_key_values is None
                 else (past_key_values.get_seq_length() if hasattr(past_key_values, "get_seq_length") else len(past_key_values))
             )
             mode = "caching" if cache_len == 0 else "generating"
 
-            # Forward-pass preparation (evi embedding update)
+            # Update <G> embeddings and event ids for this step
             vision_start_positions, vision_end_positions,event_id = self._prepare_forward_pass_for_infer(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -3672,7 +3898,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):   
                 # calculate RoPE index once per generation in the pre-fill stage only
                 if (
-                    (cache_position is not None and cache_position[0] == 0)     # compute position_ids and self.rope_deltas in the caching phase
+                    (cache_position is not None and cache_position[0] == 0)
                     or self.rope_deltas is None
                     or (past_key_values is None or past_key_values.get_seq_length() == 0)
                 ):         
@@ -3689,24 +3915,20 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 else:
                     batch_size, seq_length, _ = inputs_embeds.shape
                     
-                    # Compute new_cache_position first (for parallel samples)
+                    # Parallel branches share positions: map cache_position to the branch position
                     new_cache_position = [None] * batch_size
                     for b in range(batch_size):
                         if hasattr(self, 'parallel') and self.parallel[b]:
                             new_cache_position[b] = (cache_position.item() - self.serial_end_positions[b]- 1) // self.evi_count[b] + 1 + self.serial_end_positions[b]
                     
-                    # Compute delta per sample
                     if cache_position is not None:
                         delta_list = []
                         for b in range(batch_size):
                             if hasattr(self, 'parallel') and self.parallel[b] and new_cache_position[b] is not None:
-                                # Parallel sample: use new_cache_position[b]
                                 cache_pos_b = new_cache_position[b]
                             else:
-                                # Non-parallel sample: use cache_position[0]
                                 cache_pos_b = cache_position[0].item()
                             
-                            # self.rope_deltas has shape [batch_size, 1], so self.rope_deltas[b] is [1]; .item() extracts the scalar
                             delta_b = cache_pos_b + self.rope_deltas[b].item()
                             delta_list.append(delta_b)
                         
@@ -3720,11 +3942,10 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
                             
 
-            # Forward pass (in the caching phase, register the attn-row capture hook beforehand if the hook path is used)
+            # Forward pass (capture the attention row during caching if needed)
             attn_row_handle, attn_row_storage = None, None
             infer_layer_index = getattr(self.config, 'vision_audio_layer_index', None)
-            if (mode == 'caching' and use_attention_head and not use_legacy_attn_row
-                    and infer_layer_index is not None):
+            if mode == 'caching' and use_attention_head and infer_layer_index is not None:
                 attn_row_handle, attn_row_storage = self._register_attn_row_capture(infer_layer_index)
             outputs = self.model(
                 input_ids=None,
@@ -3742,17 +3963,17 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             )
             if attn_row_handle is not None:
                 attn_row_handle.remove()
-                # Compute attention rows [B, seq_len, 1] for the whole batch at once, for the caching loop below
                 attn_rows_all = self._attn_row_from_capture(attn_row_storage, last_text_token_indices, infer_layer_index)
             else:
                 attn_rows_all = None
 
-            # Process forward-pass outputs in the caching phase
+            # Caching phase: cache vision states and read out the first <G> interval
             if mode == 'caching':
                 self.cache_img_state = []
                 self.cache_img_state_score = []
                 self.cache_timestep_token_ranges = []
                 self.cache_frm_tokens_all = []
+                self.cache_bnd_info = []
                 batch_size = inputs_embeds.shape[0]
                 self.tgt = [[] for _ in range(batch_size)]  
                 self.serial_evi_tgts = [[] for _ in range(batch_size)]  
@@ -3762,7 +3983,6 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 self.evi_count = [0] * batch_size
 
                 for b in range(batch_size):
-                    # Number of timesteps: taken from the per-timestep index list length (audio_token_indices_per_timestep preferred)
                     if audio_token_indices_per_timestep and b < len(audio_token_indices_per_timestep):
                         num_timesteps = len(audio_token_indices_per_timestep[b])
                     elif video_token_indices_per_timestep and b < len(video_token_indices_per_timestep):
@@ -3770,7 +3990,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     else:
                         num_timesteps = 0
 
-                    # Use video/audio_token_indices_per_timestep to get each timestep's range within the vision sequence, for tgt-based averaging during generating
+                    # Per-timestep token indices for aggregation during generation
                     self.cache_timestep_token_ranges.append(
                         self._get_timestep_token_ranges_from_per_timestep(
                             b=b,
@@ -3783,45 +4003,25 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                         )
                     )
 
-                    # Extract the vision segment from hidden states
                     vision_audio_layer_index = getattr(self.config, 'vision_audio_layer_index', None)
                     layer_hidden_states = outputs.hidden_states[vision_audio_layer_index]  # [batch_size, seq_len, hidden_size]
                     vision_audio_hidden = layer_hidden_states[b, vision_start_positions[b].item()+1:vision_end_positions[b].item()]  # [vision_token_len, hidden_size]
 
-                    # Save processed vision tokens and scores for later weighting
-                    use_score_head = getattr(self.config, 'use_score_head', False)
+                    # Cache vision states and attention scores for weighted aggregation
                     use_attention_head = getattr(self.config, 'use_attention_head', False)
-                    if use_score_head:
-                        score_tokens_all = self.score_head(outputs.hidden_states[-2])
-                        score_tokens = score_tokens_all[b, vision_start_positions[b].item()+1:vision_end_positions[b].item()]  # [vision_token_len, 1]
-                        last_text_to_vision_attn_maps = torch.sigmoid(score_tokens)  # [vision_token_len, 1]
-                    elif use_attention_head:
-                        if attn_rows_all is not None:
-                            # New path: rows recomputed by the hook [B, seq_len, 1]
-                            attn_maps_all = attn_rows_all
-                        else:
-                            # Legacy path (use_legacy_attn_row=True): materialize the full-layer attention, then slice out the row
-                            attn = outputs.attentions[vision_audio_layer_index]
-                            batch_size = attn.shape[0]
-                            last_text_token_indices_local = last_text_token_indices.to(device=attn.device).squeeze(-1)  # slice at the last text token, then average over heads
-                            attn_sliced = attn[torch.arange(batch_size, device=attn.device), :, last_text_token_indices_local, :]  # [B, num_heads, L]
-                            attn_maps_all = attn_sliced.mean(dim=1).unsqueeze(-1)  # [B, seq_len, 1]
-                        # Keep only the vision-token part
-                        last_text_to_vision_attn_maps = attn_maps_all[b, vision_start_positions[b].item()+1:vision_end_positions[b].item()]  # [vision_token_len, 1]
+                    if use_attention_head and attn_rows_all is not None:
+                        last_text_to_vision_attn_maps = attn_rows_all[b, vision_start_positions[b].item()+1:vision_end_positions[b].item()]  # [vision_token_len, 1]
                     else:
                         last_text_to_vision_attn_maps = None
                     self.cache_img_state.append(vision_audio_hidden)
                     self.cache_img_state_score.append(last_text_to_vision_attn_maps)
 
-                    # Pass hidden states through the frm head to get frm_tokens_all, then extract the vision tokens: frm_tokens
                     frm_tokens_all = self.frm_head(outputs.hidden_states[-2])
                     frm_tokens = frm_tokens_all[b, vision_start_positions[b].item()+1:vision_end_positions[b].item()]
 
-                    # Pass hidden states through the evi head to get evi_tokens_all, then take the last token: evi_tokens [1, hidden_size]
                     evi_tokens_all = self.evi_head(outputs.hidden_states[-2])
                     evi_tokens = evi_tokens_all[b][-1].unsqueeze(0)
 
-                    # Compute per-timestep vision info (using per-timestep indices) and cache it
                     vision_info_tensor = self._compute_vision_info_per_timestep(
                         b=b,
                         vision_start_positions=vision_start_positions,
@@ -3833,13 +4033,23 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                         audio_token_indices_per_timestep=audio_token_indices_per_timestep or [],
                     )  # [num_timesteps, hidden_size]
                     self.cache_frm_tokens_all.append(vision_info_tensor)
+                    # Boundary features for snapping
+                    snap_on = int(getattr(self.config, 'grounding_snap_window', 0) or 0) > 0
+                    if snap_on:
+                        bnd_tokens = self.bnd_frm_head(outputs.hidden_states[-2])[b, vision_start_positions[b].item()+1:vision_end_positions[b].item()]
+                        self.cache_bnd_info.append(self._compute_vision_info_per_timestep(
+                            b=b, vision_start_positions=vision_start_positions, vision_end_positions=vision_end_positions,
+                            input_ids=input_ids_copy, frm_vision_tokens=bnd_tokens, num_timesteps=num_timesteps,
+                            video_token_indices_per_timestep=video_token_indices_per_timestep or [],
+                            audio_token_indices_per_timestep=audio_token_indices_per_timestep or []))
 
-                    # Compute similarity and tgt from frm_tokens and evi_tokens, then store into sim and tgt
-                    # self.sim = []
+                    # Ground the last token
                     sim_pred = torch.matmul(evi_tokens, vision_info_tensor.t()) / (evi_tokens.size(1) ** 0.5)  # [num_evi_tokens, num_timesteps]
                     sim_pred = torch.sigmoid(sim_pred)  
                     tgt_pred = self.find_and_merge(sim_pred)
-                    # Store as a single-interval list [[s,e]] (one event maps to one grounded interval)
+                    if snap_on:
+                        ss, se = self._boundary_sims(outputs.hidden_states[-2][b][-1], self.cache_bnd_info[b])
+                        tgt_pred = self._snap_readout(tgt_pred, ss, se)
                     self.tgt[b].append(tgt_pred if tgt_pred else [[0, 0]])
 
 
@@ -3861,17 +4071,32 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             elif mode == 'generating':
                 batch_size = inputs_embeds.shape[0]
                 for b in range(batch_size):
-                    # Pass hidden states through the evi head to get evi_tokens_all, then take the last token: evi_tokens [1, hidden_size]
                     evi_tokens_all = self.evi_head(outputs.hidden_states[-2])
                     evi_tokens = evi_tokens_all[b][-1].unsqueeze(0)
     
-                    # Fetch the cached per-timestep vision info from self.cache_frm_tokens_all and compute similarity
+                    # Ground against the cached per-timestep features
                     vision_info_tensor = self.cache_frm_tokens_all[b]
                     sim_pred = torch.matmul(evi_tokens, vision_info_tensor.t()) / (evi_tokens.size(1) ** 0.5)  # [num_evi_tokens, num_timesteps]
                     sim_pred = torch.sigmoid(sim_pred)
+                    # Coverage mask (planning only): zero timesteps claimed by earlier <G>s,
+                    # falling back to the unmasked curve if nothing remains.
+                    if (getattr(self.config, 'grounding_coverage_mask', False)
+                            and (getattr(self, 'serial_end_positions', None) is None
+                                 or self.serial_end_positions[b] is None)
+                            and getattr(self, 'serial_evi_tgts', None) and self.serial_evi_tgts[b]):
+                        masked = sim_pred.clone()
+                        for seg in self.serial_evi_tgts[b]:
+                            for st, en in seg:
+                                if en >= st:
+                                    masked[:, max(0, int(st)):int(en) + 1] = 0
+                        if masked.max().item() > 0:
+                            sim_pred = masked
                     tgt_pred = self.find_and_merge(sim_pred)
-                    # Anchor evi in the parallel phase (this step's output is forced to the j-th anchor): its interval must match serial G_j.
-                    # Override the prediction computed from the <S>/previous-anchor hidden state so the anchor's timestamp = planning-phase grounding.
+                    _snap = int(getattr(self.config, 'grounding_snap_window', 0) or 0) > 0
+                    if _snap and getattr(self, 'cache_bnd_info', None):
+                        ss, se = self._boundary_sims(outputs.hidden_states[-2][b][-1], self.cache_bnd_info[b])
+                        tgt_pred = self._snap_readout(tgt_pred, ss, se)
+                    # Parallel anchor j reuses the interval of planning <G> j
                     appended = None
                     if getattr(self, 'serial_end_positions', None) is not None and self.serial_end_positions[b] is not None:
                         anchor_j = cache_position.item() - self.serial_end_positions[b]
@@ -3929,28 +4154,28 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         audio_token_indices_per_timestep: Optional[list] = None,
         event_id: Optional[torch.LongTensor] = None,
         parallel_start_idx: Optional[torch.LongTensor] = None,
+        task: Optional[list] = None,
         **loss_kwargs,
     ):
-        # step1: prepare forward-pass arguments (attention mask, position ids, inputs embeds, etc.)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        # step2: build inputs embeds from input_ids + video/audio embeddings, then build the attention mask
+        # Build input embeddings with image/video/audio features merged in
         if inputs_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)  # convert token ids to embeddings; video/audio features are merged in below
+            inputs_embeds = self.model.embed_tokens(input_ids)
             if pixel_values is not None:
                 inputs_embeds, _ = self.get_image_embeds(pixel_values, image_grid_thw, input_ids, inputs_embeds)
             if pixel_values_videos is not None:
-                inputs_embeds, _ = self.get_video_embeds(pixel_values_videos, video_grid_thw, input_ids, inputs_embeds) # splice encoder video features into the sequence
-            if audio_feature is not None:   # same as video above
+                inputs_embeds, _ = self.get_video_embeds(pixel_values_videos, video_grid_thw, input_ids, inputs_embeds)
+            if audio_feature is not None:
                 inputs_embeds, _ = self.get_audio_embeds(audio_feature, input_ids, inputs_embeds)
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
-        # step3.a: evidence-mode forward pass
+        # Grounding (evidence) mode
         use_evidence = getattr(self.config, 'use_evidence', False)
         if use_evidence:
             return self.evi_forward(
@@ -3980,12 +4205,13 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 second_per_grid_ts=second_per_grid_ts,
                 event_id=event_id,
                 parallel_start_idx=parallel_start_idx,
+                task=task,
                 last_text_token_indices=loss_kwargs.get("last_text_token_indices", None) if loss_kwargs else None,
                 loss_kwargs=loss_kwargs,
             )
         else:
             # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
-            if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):   # not entered in the current pipeline
+            if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
                 # calculate RoPE index once per generation in the pre-fill stage only
                 if (
                     (cache_position is not None and cache_position[0] == 0)
@@ -4016,7 +4242,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     position_ids = position_ids.add(delta)
                     position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        # step3.b: sft-mode forward pass
+        # Plain SFT forward
         outputs = self.model(
             input_ids=None,
             position_ids=position_ids,
@@ -4026,7 +4252,6 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-                # output_hidden_states=True,
             return_dict=return_dict,
             cache_position=cache_position,
             event_id=event_id,
@@ -4038,7 +4263,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         loss = None
         logits = None
 
-        # step4: compute loss in training mode, logits in eval mode
+        # Loss in training mode, logits otherwise
         if self.training and (labels is not None or shift_labels is not None):
             loss = LigerForCausalLMLoss(
                 hidden_states=hidden_states,
@@ -4077,163 +4302,15 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             rope_deltas=self.rope_deltas,
         )
 
-    def dpo_forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        chosen_ids: Optional[torch.LongTensor] = None,
-        reject_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        chosen_attention_mask: Optional[torch.Tensor] = None,
-        reject_attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        chosen_position_ids: Optional[torch.LongTensor] = None,
-        reject_position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        chosen_labels: Optional[torch.LongTensor] = None,
-        reject_labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        rope_deltas: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        second_per_grid_ts: Optional[torch.Tensor] = None,
-        train_type: Optional[str] = None,
-        audio_feature: Optional[torch.Tensor] = None,
-        audio_lengths: Optional[list] = None,
-        **loss_kwargs,
-    ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        chosen_embeds = self.model.embed_tokens(chosen_ids)
-        reject_embeds = self.model.embed_tokens(reject_ids)
-        if pixel_values is not None:
-            chosen_embeds, image_embeds = self.get_image_embeds(pixel_values, image_grid_thw, chosen_ids, chosen_embeds)
-            reject_embeds = self.get_image_embeds(pixel_values, image_grid_thw, reject_ids, reject_embeds, image_embeds)
-
-        if pixel_values_videos is not None:
-            chosen_embeds, video_embeds = self.get_video_embeds(pixel_values_videos, video_grid_thw, chosen_ids, chosen_embeds)
-            reject_embeds = self.get_video_embeds(pixel_values_videos, video_grid_thw, reject_ids, reject_embeds, video_embeds)
-
-        if audio_feature is not None:
-            chosen_embeds, audio_embeds = self.get_audio_embeds(audio_feature, chosen_ids, chosen_embeds)
-            reject_embeds = self.get_audio_embeds(audio_feature, reject_ids, reject_embeds, audio_embeds)
-
-        if chosen_attention_mask is not None:
-            chosen_attention_mask = chosen_attention_mask.to(chosen_embeds.device)
-
-        if reject_attention_mask is not None:
-            reject_attention_mask = reject_attention_mask.to(reject_embeds.device)
-
-        policy_chosen_outputs = self.model(
-            input_ids=None,
-            position_ids=chosen_position_ids,
-            attention_mask=chosen_attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=chosen_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-        )
-        policy_reject_outputs = self.model(
-            input_ids=None,
-            position_ids=reject_position_ids,
-            attention_mask=reject_attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=reject_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-        )
-        policy_chosen_hidden_states = policy_chosen_outputs[0]
-        policy_reject_hidden_states = policy_reject_outputs[0]
-
-        len_input = sum(labels[0] == IGNORE_INDEX)
-        policy_chosen_hidden_states = policy_chosen_hidden_states[:, len_input-1:-1, :]
-        policy_reject_hidden_states = policy_reject_hidden_states[:, len_input-1:-1, :]
-
-        chosen_labels_in = chosen_labels[:, len_input:]
-        reject_labels_in = reject_labels[:, len_input:]
-
-        inputs_return = pad_and_stack(
-            policy_chosen_hidden_states,
-            policy_reject_hidden_states,
-            0.0
-        )
-        target_return = pad_and_stack(
-            chosen_labels_in,
-            reject_labels_in,
-            -100
-        )
-        if train_type == "gdpo":
-            inputs_embeds = self.model.embed_tokens(input_ids)
-            if pixel_values is not None:
-                inputs_embeds = self.get_image_embeds(pixel_values, image_grid_thw, input_ids, inputs_embeds, image_embeds)
-
-            if pixel_values_videos is not None:
-                inputs_embeds = self.get_video_embeds(pixel_values_videos, video_grid_thw, input_ids, inputs_embeds, video_embeds)
-
-            if audio_feature is not None:
-                inputs_embeds = self.get_audio_embeds(audio_feature, input_ids, inputs_embeds, audio_embeds)
-
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(inputs_embeds.device)
-            outputs = self.model(
-                input_ids=None,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                cache_position=cache_position,
-            )
-            hidden_states = outputs[0]
-            shift_labels = loss_kwargs.pop("shift_labels", None)
-            loss = LigerForCausalLMLoss(
-                hidden_states=hidden_states,
-                lm_head_weight=self.lm_head.weight,
-                labels=labels,
-                shift_labels=shift_labels,
-                hidden_size=self.config.hidden_size,
-                **loss_kwargs,
-            )
-            return inputs_return, target_return, loss
-        else:
-            return inputs_return, target_return
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        chosen_ids: Optional[torch.LongTensor] = None,
-        reject_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        chosen_attention_mask: Optional[torch.Tensor] = None,
-        reject_attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        chosen_position_ids: Optional[torch.LongTensor] = None,
-        reject_position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
-        chosen_labels: Optional[torch.LongTensor] = None,
-        reject_labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -4245,7 +4322,6 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
-        train_type: Optional[str] = "sft",
         audio_feature: Optional[torch.Tensor] = None,
         audio_lengths: Optional[list] = None,
         tgt: Optional[list] = None,
@@ -4259,81 +4335,46 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         audio_token_indices_per_timestep: Optional[list] = None,
         event_id: Optional[torch.LongTensor] = None,
         parallel_start_idx: Optional[torch.LongTensor] = None,
+        task: Optional[list] = None,
         **loss_kwargs,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
-        if train_type == "sft":
-            return self.sft_forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                rope_deltas=rope_deltas,
-                cache_position=cache_position,
-                second_per_grid_ts=second_per_grid_ts, 
-                audio_feature=audio_feature,
-                audio_lengths=audio_lengths,
-                tgt=tgt,
-                video_token_indices_list=video_token_indices_list,
-                audio_token_indices_list=audio_token_indices_list,
-                video_token_indices_list_src=video_token_indices_list_src,
-                audio_token_indices_list_src=audio_token_indices_list_src,
-                tgt_timestep_distances=tgt_timestep_distances,
-                timestep_duration=timestep_duration,
-                video_token_indices_per_timestep=video_token_indices_per_timestep,
-                audio_token_indices_per_timestep=audio_token_indices_per_timestep,
-                event_id=event_id,
-                parallel_start_idx=parallel_start_idx,
-                **loss_kwargs
-            )
-        elif train_type == "dpo" or train_type == "gdpo":
-            return self.dpo_forward(
-                input_ids=input_ids,
-                chosen_ids=chosen_ids,
-                reject_ids=reject_ids,
-                attention_mask=attention_mask,
-                chosen_attention_mask=chosen_attention_mask,
-                reject_attention_mask=reject_attention_mask,
-                position_ids=position_ids,
-                chosen_position_ids=chosen_position_ids,
-                reject_position_ids=reject_position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                chosen_labels=chosen_labels,
-                reject_labels=reject_labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                rope_deltas=rope_deltas,
-                cache_position=cache_position,
-                second_per_grid_ts=second_per_grid_ts, 
-                train_type=train_type,
-                audio_feature=audio_feature,
-                audio_lengths=audio_lengths,
-                **loss_kwargs
-            )
-        else:
-            raise NotImplementedError
+        return self.sft_forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            rope_deltas=rope_deltas,
+            cache_position=cache_position,
+            second_per_grid_ts=second_per_grid_ts, 
+            audio_feature=audio_feature,
+            audio_lengths=audio_lengths,
+            tgt=tgt,
+            video_token_indices_list=video_token_indices_list,
+            audio_token_indices_list=audio_token_indices_list,
+            video_token_indices_list_src=video_token_indices_list_src,
+            audio_token_indices_list_src=audio_token_indices_list_src,
+            tgt_timestep_distances=tgt_timestep_distances,
+            timestep_duration=timestep_duration,
+            video_token_indices_per_timestep=video_token_indices_per_timestep,
+            audio_token_indices_per_timestep=audio_token_indices_per_timestep,
+            event_id=event_id,
+            parallel_start_idx=parallel_start_idx,
+            task=task,
+            **loss_kwargs
+        )
 
     def _aggregate_interval_feature(self, b, intervals):
-        """Aggregate video/audio features from the prefill cache over the predicted time intervals; returns a [hidden_size] vector.
-        Same logic as the generating branch of _prepare_forward_pass_for_infer (per-modality softmax weighting
-        or plain mean within the interval, video + audio_mean_weight * audio); used as the input embedding of the parallel anchor <G>."""
+        """Aggregate cached video/audio features over the given intervals into a [hidden_size] vector."""
         cached = self.cache_timestep_token_ranges[b]
         cache_hidden = self.cache_img_state[b]
         cache_hidden_score = self.cache_img_state_score[b] if self.cache_img_state_score[b] is not None else None
@@ -4364,20 +4405,98 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 return torch.sum(feat * score, dim=0).to(device=device, dtype=dtype)
             return torch.mean(feat, dim=0).to(device=device, dtype=dtype)
 
-        aw = getattr(self.config, 'audio_mean_weight', 1.0)
+        aw = float(getattr(self.config, 'audio_mean_weight', 1.0))
         return _weighted_mean(video_list, video_scores_list) + aw * _weighted_mean(audio_list, audio_scores_list)
 
+    @torch.no_grad()
+    def _build_event_vision_visibility_train(self, input_ids, vision_start_positions, vision_end_positions,
+                                             event_id, tgt_timestep_distances,
+                                             video_token_indices_per_timestep, audio_token_indices_per_timestep):
+        """Per-sample [num_events, L] bool masks limiting each event's vision keys to its GT interval
+        (+- branch_interval_margin); None for samples without events."""
+        margin = int(getattr(self.config, 'branch_interval_margin', 1))
+        B, L = input_ids.shape
+        out = []
+        for b in range(B):
+            eid = event_id[b] if event_id is not None and b < len(event_id) else None
+            if (eid is None or tgt_timestep_distances is None or b >= len(tgt_timestep_distances)
+                    or tgt_timestep_distances[b] is None or len(tgt_timestep_distances[b]) == 0):
+                out.append(None)
+                continue
+            K = int(eid.max().item()) + 1
+            dist = torch.tensor(tgt_timestep_distances[b], dtype=torch.float32)[:K]  # [K, num_ts]
+            num_ts = dist.shape[1]
+            ranges = self._get_timestep_token_ranges_from_per_timestep(
+                b=b, vision_start_positions=vision_start_positions, vision_end_positions=vision_end_positions,
+                input_ids=input_ids, num_timesteps=num_ts,
+                video_token_indices_per_timestep=video_token_indices_per_timestep,
+                audio_token_indices_per_timestep=audio_token_indices_per_timestep)
+            vs = vision_start_positions[b].item()
+            ve = vision_end_positions[b].item()
+            visible = torch.ones(K, L, dtype=torch.bool, device=input_ids.device)
+            visible[:, vs + 1:ve] = False
+            if getattr(self.config, 'branch_interval_audio_full', False):
+                # Confine only video tokens; keep the whole audio stream visible
+                seg_audio = (input_ids[b, vs + 1:ve] == self.config.audio_token_id)
+                visible[:, vs + 1:ve] |= seg_audio.unsqueeze(0)
+            for e in range(K):
+                inside = (dist[e] == 0).nonzero(as_tuple=True)[0]
+                if inside.numel() == 0:
+                    visible[e, vs + 1:ve] = True   # no GT interval: unrestricted
+                    continue
+                lo, hi = max(0, inside.min().item() - margin), min(num_ts - 1, inside.max().item() + margin)
+                for ts in range(lo, hi + 1):
+                    if ts >= len(ranges):
+                        break
+                    v_idx, a_idx = ranges[ts]
+                    for idx in (v_idx, a_idx):
+                        if idx is not None and idx.numel() > 0:
+                            visible[e, vs + 1 + idx.to(input_ids.device)] = True
+            out.append(visible)
+        return out
+
+
+    def _build_branch_prefix_visibility(self, input_ids, K, prefix_len, device):
+        """[K, prefix_len] bool mask: branch j sees all text but only vision tokens within its own
+        interval (+- branch_interval_margin). Returns None if the cached vision layout does not match."""
+        margin = int(getattr(self.config, 'branch_interval_margin', 1))
+        ids = input_ids[0]
+        vs_pos = (ids == self.config.vision_start_token_id).nonzero(as_tuple=True)[0]
+        ve_pos = (ids == self.config.vision_end_token_id).nonzero(as_tuple=True)[0]
+        if vs_pos.numel() == 0 or ve_pos.numel() == 0:
+            return None
+        vs, ve = vs_pos[0].item(), ve_pos[-1].item()
+        cached = self.cache_timestep_token_ranges[0]
+        if ve - (vs + 1) != self.cache_img_state[0].shape[0] or ve > prefix_len:
+            return None
+        visible = torch.ones(K, prefix_len, dtype=torch.bool, device=device)
+        visible[:, vs + 1:ve] = False
+        if getattr(self.config, 'branch_interval_audio_full', False):
+            # Keep the whole audio stream visible (as in training)
+            visible[:, vs + 1:ve] |= (ids[vs + 1:ve] == self.config.audio_token_id).unsqueeze(0)
+        for j in range(K):
+            intervals = self.serial_evi_tgts[0][j] if j < len(self.serial_evi_tgts[0]) else [[0, 0]]
+            for seg_start, seg_end in intervals:
+                lo, hi = max(0, int(seg_start) - margin), min(len(cached) - 1, int(seg_end) + margin)
+                for ts in range(lo, hi + 1):
+                    v_idx, a_idx = cached[ts]
+                    for idx in (v_idx, a_idx):
+                        if idx is not None and idx.numel() > 0:
+                            visible[j, vs + 1 + idx] = True
+        return visible
+
     def _branch_visibility_mask(self, num_query, kv_len, prefix_len, dtype, device):
-        """Branch-isolating 4D additive mask for parallel decoding, shape [1, 1, K, kv_len].
-        Visibility rules (matching training-time event-factorized attention):
-        - kv index < prefix_len (prompt + serial planning segment; <S> is never fed to the KV): visible to all branches;
-        - later kv entries belong to branch (k - prefix_len) % K in round-robin append order
-          (anchors and per-round tokens are appended in branch order): visible only to the same branch;
-        - among the current K new tokens, each sees only itself (synchronous decoding, no cross-talk)."""
+        """Branch-isolating additive mask [1, 1, K, kv_len]: the shared prefix is visible to all branches,
+        later entries (appended round-robin) only to their own branch."""
         K = num_query
         neg = torch.finfo(dtype).min
         mask = torch.full((1, 1, K, kv_len), neg, dtype=dtype, device=device)
         mask[:, :, :, :prefix_len] = 0.0
+        # Optional per-branch prefix visibility (see _build_branch_prefix_visibility)
+        pv = getattr(self, '_branch_prefix_visible', None)
+        if pv is not None and tuple(pv.shape) == (K, prefix_len):
+            mask[0, 0, :, :prefix_len] = torch.where(
+                pv, torch.tensor(0.0, dtype=dtype, device=device), torch.tensor(neg, dtype=dtype, device=device))
         if kv_len > prefix_len:
             owners = torch.arange(kv_len - prefix_len, device=device) % K       # [num_parallel_kv]
             visible = owners.unsqueeze(0) == torch.arange(K, device=device).unsqueeze(1)  # [K, num_parallel_kv]
@@ -4394,31 +4513,25 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         top_p=0.9,
         eos_token_id=None,
         constrain_planning=False,
+        min_body_tokens=0,
+        single_event_no_replan=False,
         record_separator_id=None,
         deinterleave=True,
         **gen_kwargs,
     ):
-        """Event-level parallel decoding (the inference protocol of paper Fig.2/3):
-        Phase 1 serial decoding: standard autoregressive generation. Single-event tasks
-              (grounding / segment captioning / cross-modal captioning) complete entirely in this
-              phase - one <G> followed by the answer text (or nothing), ending on EOS. Dense video
-              captioning ends this phase by generating <S> (the switch token), which triggers the
-              parallel phases below.
-        Phase 2 anchor feeding: on <S>, the K parallel anchor <G> tokens are fed in a single
-              forward (each embedding is augmented with its event's aggregated feature; anchors are
-              mutually invisible and share the same position);
-        Phase 3 parallel decoding: each step forwards K tokens at once (one per branch), with the
-              branch-isolating mask + shared positions; each branch terminates independently on EOS.
-        Returns a [1, L] flat sequence: prompt + one record per event ("<G_j> caption_j"), records
-              separated by record_separator_id. The K anchors are fed to the model but left out of
-              the returned sequence, and the planning-end <S> is dropped.
-        Also rebuilds self.tgt[0] as an interval list aligned position-by-position with the generated part (directly usable by test post-processing).
-        If <S> is never generated (single-event tasks), behaves exactly like plain generate."""
+        """Event-level parallel decoding.
+
+        Phase 1: serial decoding; single-event tasks finish here, dense captioning plans K <G> tokens and emits <S>.
+        Phase 2: feed K anchor <G> tokens (with aggregated interval features) in one forward.
+        Phase 3: decode K isolated branches in parallel until each emits EOS.
+        Returns a [1, L] sequence of per-event records and rebuilds self.tgt[0] aligned with it.
+        """
         from transformers import LogitsProcessor, LogitsProcessorList, StoppingCriteria, StoppingCriteriaList
 
         evi_id = self.config.evi_token_id
         evi_end_id = self.config.evi_end_token_id
-        anchor_id = evi_id   # anchors reuse the <G> token (fed-in copies, never predicted)
+        anchor_id = evi_id   # anchors reuse the <G> token
+        self._branch_prefix_visible = None   # set in Phase 2a
         if eos_token_id is None:
             eos_token_id = self.generation_config.eos_token_id
             if isinstance(eos_token_id, (list, tuple)):
@@ -4431,11 +4544,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         prompt_len_for_guard = input_ids.shape[1]
 
         class _ForcePlanningStop(LogitsProcessor):
-            """Planning stop guard (inference-side): once the serial <G> count reaches the cap
-            (default 30 = max event count in the training set), force <S> so a runaway planning
-            phase cannot exhaust the token budget without ever switching to the parallel branches.
-            Single-event tasks emit a single <G> and are never affected.
-            Disable via model.config.max_planning_events = 0 or None."""
+            """Force <S> once the planned <G> count reaches the cap (config.max_planning_events; 0/None disables)."""
 
             def __init__(self, cap):
                 self.cap = cap
@@ -4448,12 +4557,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 return scores
 
         class _PlanningVocabConstraint(LogitsProcessor):
-            """dvc-only guard (constrain_planning=True): restrict the serial phase to <G>/<S>.
-            Under the current protocol 6 of the 7 training tasks continue with plain text right
-            after <G>, so an under-trained model tends to slide into that majority mode on dvc
-            and never emits <S> -- the parallel phase then never fires. This constraint makes
-            the planning->parallel switch inevitable. Single-event tasks must NOT use it
-            (their answer text lives in the serial phase)."""
+            """Restrict the serial phase to <G>/<S> (dense captioning only)."""
 
             def __call__(self, ids, scores):
                 out = torch.full_like(scores, torch.finfo(scores.dtype).min)
@@ -4461,15 +4565,44 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 out[:, evi_end_id] = scores[:, evi_end_id]
                 return out
 
+        class _RequireBody(LogitsProcessor):
+            """After the first <G>, ban EOS and <S> until min_body_tokens tokens follow (single-event captioning only)."""
+
+            def __init__(self, n, banned_ids):
+                self.n = n
+                self.banned_ids = banned_ids
+
+            def __call__(self, ids, scores):
+                gen = ids[0, prompt_len_for_guard:]
+                evi_pos = (gen == evi_id).nonzero()
+                if len(evi_pos) > 0 and gen.shape[0] - (evi_pos[-1].item() + 1) < self.n:
+                    scores[:, self.banned_ids] = torch.finfo(scores.dtype).min
+                return scores
+
+        class _NoReplan(LogitsProcessor):
+            """After the first <G>, ban further <G> and <S> (single-event tasks only)."""
+
+            def __call__(self, ids, scores):
+                if bool((ids[0, prompt_len_for_guard:] == evi_id).any()):
+                    scores[:, [evi_id, evi_end_id]] = torch.finfo(scores.dtype).min
+                return scores
+
+
         max_planning_events = getattr(self.config, 'max_planning_events', 30)
         planning_processors = [_ForcePlanningStop(max_planning_events)]
         if constrain_planning:
             planning_processors.insert(0, _PlanningVocabConstraint())
+        if min_body_tokens and min_body_tokens > 0:
+            eos_all = self.generation_config.eos_token_id
+            eos_all = list(eos_all) if isinstance(eos_all, (list, tuple)) else [eos_all]
+            if eos_token_id is not None and eos_token_id not in eos_all:
+                eos_all.append(eos_token_id)
+            banned = [t for t in eos_all if t is not None] + [evi_end_id]
+            planning_processors.insert(0, _RequireBody(min_body_tokens, banned))
+        if single_event_no_replan:
+            planning_processors.insert(0, _NoReplan())
 
-        # ---------- Phase 1: serial decoding (fully reuses the existing generate machinery and cache/aggregation/tgt recording).
-        # Vocabulary is unconstrained: single-event tasks produce their whole answer here and end
-        # on EOS; only generating <S> switches into the parallel phases. The full max_new_tokens
-        # budget applies because for single-event tasks this phase IS the answer. ----------
+        # ---------- Phase 1: serial decoding until EOS or <S> ----------
         out1 = self.generate(
             input_ids=input_ids,
             **gen_kwargs,
@@ -4488,22 +4621,21 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
 
         if (seq[0, -1].item() != evi_end_id or cache is None
                 or not getattr(self, 'evi_count', None) or self.evi_count[0] == 0):
-            return seq  # parallel phase not entered: same behavior as plain generate
+            return seq  # no parallel phase
         K = self.evi_count[0]
 
-        # ---------- Phase 2a: <S> is not written into the KV cache (aligned with training) ----------
-        # At training time the anchors' conditioning context = prompt + serial evis (<S> exists only
-        # in labels, never in the input), and anchor position = last serial evi + 1. Inference stays
-        # consistent: <S> is a pure stop signal (like EOS, generating it triggers the switch but it
-        # never conditions the context), so the anchors directly follow the last serial evi.
-        prefix_len = cache.get_seq_length()      # prefix visible to all branches: prompt + serial segment (excluding <S>)
-        anchor_pos = prefix_len                  # shared logical position of the anchors = last_evi + 1, matching training
+        # ---------- Phase 2a: shared prefix (<S> is not written to the KV cache, as in training) ----------
+        prefix_len = cache.get_seq_length()      # prompt + planning segment
+        anchor_pos = prefix_len                  # shared position of all anchors
+        self._branch_prefix_visible = (
+            self._build_branch_prefix_visibility(input_ids, K, prefix_len, device)
+            if getattr(self.config, 'branch_interval_attention', False) else None)
         embed = self.get_input_embeddings()
         compute_dtype = self.lm_head.weight.dtype
         rope_delta = self.rope_deltas[0].item() if self.rope_deltas is not None else 0
 
         def _parallel_step(token_embeds, logical_pos):
-            """One parallel forward step: K tokens share position logical_pos, branches isolated. Returns [K, vocab] logits."""
+            """Forward K branch tokens at a shared position; returns [K, vocab] logits."""
             cur_len = cache.get_seq_length()
             kv_len = cur_len + K
             mask = self._branch_visibility_mask(K, kv_len, prefix_len, compute_dtype, device)
@@ -4519,10 +4651,15 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             return self.lm_head(outputs.last_hidden_state[0])  # [K, vocab]
 
         def _sample_tokens(logits):
-            # Constrained decoding for the branch phase: per protocol, branch content must not contain
-            # protocol tokens (<G>/<S>/<shift> belong only to planning and boundaries),
-            # symmetric to the planning-phase vocab constraint
-            for tid in (evi_id, evi_end_id, self.config.shift_token_id):
+            # Ban special and modality tokens in branch captions
+            ban = [evi_id, evi_end_id, self.config.shift_token_id]
+            for name in ("audio_token_id", "video_token_id", "image_token_id",
+                         "vision_start_token_id", "vision_end_token_id",
+                         "audio_start_token_id", "audio_end_token_id"):
+                tid = getattr(self.config, name, None)
+                if isinstance(tid, int) and 0 <= tid < logits.shape[-1]:
+                    ban.append(tid)
+            for tid in ban:
                 logits[:, tid] = torch.finfo(logits.dtype).min
             if do_sample:
                 probs = F.softmax(logits.float(), dim=-1)
@@ -4535,7 +4672,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 return sorted_idx.gather(-1, choice.unsqueeze(-1)).squeeze(-1)
             return logits.argmax(dim=-1)  # [K]
 
-        # ---------- Phase 2b: feed all K anchors in one forward (embeddings augmented with per-event aggregated features; anchors mutually invisible) ----------
+        # ---------- Phase 2b: feed all K anchors in one forward ----------
         anchor_embeds = embed(torch.full((1, K), anchor_id, dtype=torch.long, device=device)).to(compute_dtype)
         for j in range(K):
             intervals = self.serial_evi_tgts[0][j] if j < len(self.serial_evi_tgts[0]) else [[0, 0]]
@@ -4546,11 +4683,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         # ---------- Phase 3: parallel decoding; branches terminate independently ----------
         branches = [[t.item()] for t in next_tokens]
         finished = [t.item() == eos_token_id for t in next_tokens]
-        # Per-branch length cap. Deliberately NOT max_new_tokens // K: every loop iteration is one
-        # forward that advances all K branches at once, so wall-clock scales with this cap alone and
-        # not with K -- dividing by K threw away the whole point of parallel decoding and truncated
-        # captions mid-sentence (at K=30 it left 34 tokens, while the median training caption is 75
-        # and P95 is 281). The default covers P95 with margin; override via config.max_branch_tokens.
+        # Per-branch length cap (independent of K)
         per_branch_cap = getattr(self.config, 'max_branch_tokens', 320)
         round_idx = 0
         while not all(finished) and round_idx < per_branch_cap:
@@ -4559,7 +4692,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             sampled = _sample_tokens(logits)
             for j in range(K):
                 if finished[j]:
-                    sampled[j] = eos_token_id    # finished branch: feed EOS as a placeholder, stop recording output
+                    sampled[j] = eos_token_id    # finished branch: feed EOS placeholder
                 else:
                     branches[j].append(sampled[j].item())
                     if sampled[j].item() == eos_token_id:
@@ -4572,13 +4705,12 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         serial_tokens = seq[0, prompt_len:].tolist()
         serial_tgts = list(self.tgt[0][:serial_gen_len])
         if deinterleave:
-            # Readable mode (default): one record per event, "<G_j> caption_j", joined with
-            # record_separator_id (a newline in practice; the caller owns the tokenizer).
+            # One record per event, "<G_j> caption_j", joined by record_separator_id
             assert record_separator_id is not None, \
                 "generate_parallel needs record_separator_id to delimit per-event records"
             flat_tokens, flat_tgts, j = [], [], 0
             for tok, tg in zip(serial_tokens, serial_tgts):
-                if tok == evi_id and j < K:                      # event token: attach its own branch
+                if tok == evi_id and j < K:                      # attach the event's branch
                     if j > 0:
                         flat_tokens.append(record_separator_id)
                         flat_tgts.append([[0, 0]])
@@ -4588,15 +4720,12 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     flat_tgts.extend([[[0, 0]]] * len(branches[j]))
                     j += 1
                 elif tok == evi_end_id:
-                    continue                                     # planning-end <S>: records are already delimited
+                    continue                                     # drop <S>
                 else:
-                    flat_tokens.append(tok)                      # keep anything else the serial phase produced
+                    flat_tokens.append(tok)
                     flat_tgts.append(tg)
         else:
-            # Raw mode: emit the prediction in physical generation order -- the serial segment
-            # (including <S>), the K fed anchors, then the branch tokens round by round exactly
-            # as the parallel steps produced them (branch 0..K-1 within each round; branches
-            # that finished earlier simply stop contributing).
+            # Raw mode: serial segment, K anchors, then branch tokens in generation order
             flat_tokens = list(serial_tokens)
             flat_tgts = list(serial_tgts)
             for j in range(K):
@@ -4630,20 +4759,15 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         video_grid_thw=None,
         second_per_grid_ts=None,
         audio_feature=None,
-        # video_token_indices_list=None,
-        # audio_token_indices_list=None,
         video_token_indices_list_src=None,
         audio_token_indices_list_src=None,
-        # tgt_timestep_distances=None,
         video_token_indices_per_timestep=None,
         audio_token_indices_per_timestep=None,
         last_text_token_indices=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
-        # The evidence-related parameters above must appear in the signature, otherwise
-        # transformers._validate_model_kwargs raises "not used by the model".
-        # They are not passed to super() (the parent doesn't handle them); they are only written into model_inputs here for forward.
+        # Grounding kwargs must be in the signature to pass kwarg validation; they are added to model_inputs below.
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
@@ -4664,7 +4788,7 @@ class video_SALMONN2_plus(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         # Qwen2-5-VL position_ids are prepareed with rope_deltas in forward
         model_inputs["position_ids"] = None
 
-        # Detect whether this is the first generation step (generating-phase handling)
+        # Multimodal inputs are only needed at the first step
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None

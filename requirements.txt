@@ -1,9 +1,10 @@
 # Tested environment: Python 3.12, CUDA 12.6
+# System dependencies (install first): FFmpeg (video/audio decoding via torchcodec) and Java (METEOR in pycocoevalcap)
+#   conda install -c conda-forge ffmpeg openjdk
 # Install PyTorch first (with the CUDA build matching your system):
-#   pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+#   pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu126
 torch==2.7.1
 torchvision==0.22.1
-torchaudio==2.7.1
 torchcodec==0.4.0
 
 transformers==4.51.3
@@ -14,10 +15,11 @@ liger-kernel==0.5.10
 safetensors==0.6.2
 
 numpy==2.2.6
-einops==0.8.1
 pillow==11.3.0
-opencv-python==4.12.0.88
 decord==0.6.0
 
 tqdm==4.67.1
 wandb==0.22.3
+
+# dvc evaluation (my_tools/etbench_dvc_metrics.py)
+pycocoevalcap==1.2

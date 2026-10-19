@@ -425,19 +425,16 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         self.allow_vision_see_query = allow_vision_see_query
         self.use_flashattention = use_flashattention
 
-        # Set attention implementation based on use_flashattention
-        # If _attn_implementation is explicitly set in kwargs, use it (higher priority)
-        # Otherwise, use use_flashattention to determine the implementation
+        # Explicit _attn_implementation wins; otherwise use_flashattention picks flash_attention_2 or sdpa
         if "_attn_implementation" in kwargs:
             self._attn_implementation = kwargs["_attn_implementation"]
         else:
             if use_flashattention:
                 self._attn_implementation = "flash_attention_2"
             else:
-                # Prefer sdpa over eager for better performance
                 self._attn_implementation = "sdpa"
 
-        # Pass _attn_implementation to vision_config so it can be used in vision blocks
+        # Propagate to the vision blocks
         if not hasattr(self.vision_config, "_attn_implementation"):
             self.vision_config._attn_implementation = self._attn_implementation
 

@@ -14,7 +14,6 @@
 
 # Adopted from https://github.com/QwenLM/Qwen2.5-VL. The original license is located at 'third-party-license/qwenvl.txt'.
 
-from pickle import TRUE
 import transformers
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, List
@@ -34,21 +33,52 @@ class ModelArguments:
     lora_alpha: int = field(default=16)
     lora_dropout: float = field(default=0.05)
     lora_bias: str = field(default="none")
+    nan_guard: bool = field(default=False, metadata={"help": "Training: abort on the first non-finite or zero loss/grad_norm."})
+    lora_target: str = field(default="qkv", metadata={"help": "LLM layers to wrap with LoRA: 'qkv' (q/k/v) or 'all' (q/k/v/o + MLP)."})
     lora_ckpt: str = field(default="No")
     use_evidence: bool = field(default=False)
-    use_score_head: bool = field(default=False, metadata={"help": "When use_evidence=True: if True, use score_head to weight token means for evi embedding; if False, use simple mean."})
-    use_attention_head: bool = field(default=False, metadata={"help": "When use_evidence=True: if True, use attention_head to weight token means for evi embedding; if False, use simple mean."})
-    use_flashattention: bool = field(default=True, metadata={"help": "If True, use flash_attention_2; if False, use sdpa. Note: with use_evidence the inference path loads the model on sdpa regardless of this flag, because the parallel branches are isolated with a custom 4D attention mask that FlashAttention-2 does not support. Training sets it to False for the same reason."})
+    use_attention_head: bool = field(default=False, metadata={"help": "With use_evidence: weight token means with an attention head instead of a plain mean."})
+    use_flashattention: bool = field(default=True, metadata={"help": "Use flash_attention_2 if True, else sdpa (use_evidence forces sdpa for the parallel 4D mask)."})
     vision_audio_layer_index: Optional[int] = field(default=6)
     loss_match_weight: float = field(default=3.0)
-    audio_mean_weight: float = field(default=1, metadata={"help": "Weight for audio mean when summing video+audio (0-1). Used in evi embedding and vision info."})
-    union_aggregation: bool = field(default=False, metadata={"help": "If True, in evi semantic aggregation, video and audio are conbined first then softmax. If False (default, consistent with the paper and the inference path), they are softmax independently, then added to the evi as video + audio_mean_weight * audio."})
-    save_gpu_trick: bool = field(default=True, metadata={"help": "If True, only return required layer attention and hidden state to save GPU memory. If False, return all layers"})
-    grounding_threshold: float = field(default=0.8, metadata={"help": "Inference grounding: timesteps with similarity >= threshold * max are salient. Paper: 0.5 for LongVALE, 0.7 for ChronusAV. Legacy default 0.8."})
-    grounding_merge_gap: int = field(default=2, metadata={"help": "Inference grounding: salient runs separated by <= this many timesteps are bridged into one segment; larger gaps keep segments apart (one timestep is ~2s at 256-frame sampling of a few-minute video)."})
-    grounding_select: str = field(default="mass", metadata={"help": "Inference grounding: how to pick the final interval among bridged segments. 'mass' = highest summed similarity (strength x duration, default), 'longest' = longest duration, 'mean' = highest mean similarity (biases toward short spikes; for ablation)."})
-    
-    
+    loss_stop_weight: float = field(default=1.0, metadata={"help": "Training: relative LM-loss weight of the planning-stop <S> token; <=1 disables."})
+    loss_stop_symmetric: bool = field(default=False, metadata={"help": "With loss_stop_weight > 1: give dvc planning <G> positions the same weight as <S>."})
+    loss_contrast_weight: float = field(default=0.0, metadata={"help": "Training: weight of the timestep InfoNCE term on the grounding curve; 0 disables."})
+    loss_contrast_detach: bool = field(default=True, metadata={"help": "Backpropagate the InfoNCE term only into evi_head/frm_head (backbone detached)."})
+    loss_contrast_tau: float = field(default=0.1, metadata={"help": "Temperature of the InfoNCE term."})
+    grounding_target_decay: float = field(default=1.0, metadata={"help": "Training: decay of the soft grounding target 0.5^(decay * timestep_distance)."})
+    loss_boundary_weight: float = field(default=0.0, metadata={"help": "Training: weight of the start/end boundary-peak BCE on the boundary heads; 0 disables."})
+    grounding_boundary_decay: float = field(default=1.0, metadata={"help": "Training: decay of the boundary-peak soft target 0.5^(decay * |t - boundary|)."})
+    loss_plateau_weight: float = field(default=0.0, metadata={"help": "Training: weight of the plateau-consistency hinge on the grounding curve; 0 disables."})
+    grounding_plateau_ratio: float = field(default=0.7, metadata={"help": "Training: plateau ratio for loss_plateau_weight (match the inference grounding_threshold)."})
+    loss_boundary_rank_weight: float = field(default=0.0, metadata={"help": "Training: weight of the internal-peak suppression on the boundary heads; 0 disables."})
+    grounding_boundary_rank_margin: float = field(default=1.0, metadata={"help": "Training: logit margin for loss_boundary_rank_weight."})
+    readout_only: bool = field(default=False, metadata={"help": "Training: train only the grounding readout heads; use with use_lora=False."})
+    grounding_snap_window: int = field(default=0, metadata={"help": "Inference: snap interval edges to the boundary-head peaks within +- this many timesteps; 0 disables."})
+    grounding_snap_tasks: str = field(default="", metadata={"help": "Comma list of tasks using grounding_snap_window (e.g. 'dvc'); empty = all tasks."})
+    grounding_coverage_train: bool = field(default=False, metadata={"help": "Training, dvc: mask timesteps claimed by earlier events in the grounding loss (mirrors grounding_coverage_mask)."})
+    loss_iou_weight: float = field(default=0.0, metadata={"help": "Training: weight of the interval soft-IoU loss added to the BCE match loss; 0 disables."})
+    branch_interval_attention: bool = field(default=False, metadata={"help": "dvc: each parallel branch attends only to text and the media tokens of its own interval; train and test must agree."})
+    branch_interval_audio_full: bool = field(default=False, metadata={"help": "With branch_interval_attention: keep the full audio stream visible and confine only video tokens."})
+    branch_interval_margin: int = field(default=1, metadata={"help": "Timesteps of context kept on each side of the branch interval."})
+    grounding_coverage_mask: bool = field(default=False, metadata={"help": "Inference, dvc: zero timesteps claimed by earlier <G>s before each planning readout."})
+    self_aggregation_prob: float = field(default=0.0, metadata={"help": "Training: per-batch probability of aggregating <G> features from self-predicted intervals (no-grad pass); not ZeRO-3 safe; 0 disables."})
+    audio_mean_weight: float = field(default=1, metadata={"help": "Audio weight w in the per-timestep feature video + w * audio."})
+    save_gpu_trick: bool = field(default=True, metadata={"help": "Return only the required layer's attention/hidden states to save memory."})
+    grounding_threshold: float = field(default=0.8, metadata={"help": "Inference: timesteps with similarity >= threshold * max are salient."})
+    grounding_merge_gap: int = field(default=2, metadata={"help": "Inference: bridge salient runs separated by <= this many timesteps."})
+    max_planning_events: int = field(default=30, metadata={"help": "Inference, dvc: force <S> after this many planned <G>s; 0 disables."})
+    min_body_tokens: int = field(default=0, metadata={"help": "Inference, single-event caption tasks: suppress EOS/<S> until this many body tokens follow the first <G>; 0 disables."})
+    dvc_dedup_iou: float = field(default=0.0, metadata={"help": "Inference, dvc: drop records whose interval IoU with a kept record reaches this value; 0 disables."})
+    src_interval_override: bool = field(default=False, metadata={"help": "Inference, t2v/t2a: output the query interval given in the prompt instead of the readout."})
+    echo_best_of_n: int = field(default=0, metadata={"help": "Inference, v2a/a2v: resample up to N times when the output echoes the prompt description; 0/1 disables."})
+    single_event_no_replan: bool = field(default=False, metadata={"help": "Inference, single-event tasks: ban <G>/<S> after the first <G>."})
+    task_max_body_tokens: str = field(default="", metadata={"help": "Inference: per-task token cap, e.g. 't2a=90,v2a=90'; empty = 1024 for all."})
+    degenerate_retry: int = field(default=0, metadata={"help": "Inference: resample degenerate single-event captions up to N times and drop degenerate dvc records; 0/1 disables."})
+    echo_overlap_threshold: float = field(default=0.15, metadata={"help": "echo_best_of_n: accept a candidate whose prompt-overlap F1 is below this."})
+    task_audio_mean_weight: str = field(default="", metadata={"help": "Inference: per-task audio_mean_weight override, e.g. 'v2a=3.0'; empty = audio_mean_weight."})
+
+
 
 @dataclass
 class DataArguments:
@@ -61,12 +91,11 @@ class DataArguments:
     video_max_frame_pixels: int = field(default=32 * 28 * 28)
     video_min_frame_pixels: int = field(default=4 * 28 * 28)
     run_test: bool = field(default=False)
-    auto_convert_checkpoint: bool = field(default=True, metadata={"help": "Test time: if the model path has no finished model but contains checkpoint-N dirs, automatically convert the largest-step checkpoint into a loadable model (cached and reused)."})
-    aggregation_jitter_ratio: float = field(default=0.1, metadata={"help": "Train-time robustness for interval-feature aggregation: each GT interval boundary used for <G> feature aggregation is jittered by uniform(-r, r) * interval_length (match-loss GT stays clean). Mitigates the train(GT intervals)/inference(predicted intervals) exposure bias. 0 disables."})
+    auto_convert_checkpoint: bool = field(default=True, metadata={"help": "Test: convert the latest checkpoint-N into a loadable model when no final model exists."})
+    aggregation_jitter_ratio: float = field(default=0.1, metadata={"help": "Training: jitter GT interval boundaries used for <G> aggregation by uniform(-r, r) * length; 0 disables."})
     do_sample: bool = field(default=False)
     num_sample: int = field(default=1)
-    deinterleave_parallel_output: bool = field(default=True, metadata={"help": "Test time: reassemble the parallel dvc prediction into readable per-event records (interval + its caption, one per line). False keeps the raw physical generation order (serial segment, anchors, then branch tokens round by round) for debugging."})
-    train_type: str = field(default="sft")
+    deinterleave_parallel_output: bool = field(default=True, metadata={"help": "Test: reassemble parallel dvc output into per-event records; False keeps raw generation order."})
     feature_size: int = field(default=128)
     chunk_length: int = field(default=30)
     hop_length: int = field(default=160)

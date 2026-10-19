@@ -17,10 +17,9 @@ VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
 
 
 def index_videos(roots, exts):
-    """id (filename without extension) -> sorted list of absolute paths.
+    """Index videos by id (filename stem).
 
-    Returns (index, duplicate_ids, empty_files). Paths are sorted so that a run is
-    reproducible; which one an entry actually gets is decided in pick_path().
+    Returns (index: id -> sorted paths, duplicate_ids, empty_files).
     """
     found = defaultdict(list)
     empty = []
@@ -51,12 +50,7 @@ def index_videos(roots, exts):
 
 
 def pick_path(candidates, original):
-    """Choose among several copies of one video id.
-
-    The source dataset keeps some videos in more than one directory, and the copies are
-    not byte-identical. When the layout still carries the original directory name, keep
-    the entry on the copy its annotation was built from; otherwise take the first path.
-    """
+    """Pick the copy in the entry's original parent directory if present, else the first path."""
     if len(candidates) == 1 or not original:
         return candidates[0]
     original = original[0] if isinstance(original, list) else original
@@ -68,7 +62,7 @@ def pick_path(candidates, original):
 
 
 def entry_id(entry):
-    """The video this entry needs. `id` is authoritative; fall back to the shipped path."""
+    """Video id of an entry: `id`, else the stem of its video path."""
     vid = entry.get("id")
     if vid:
         return str(vid)

@@ -1,14 +1,14 @@
+# Train PadCaptioner (audio-visual dense video captioning on Qwen2.5-VL-3B).
+# Usage: bash scripts_run/train.sh --dataset TRAIN.json --model MODEL_DIR --model_base MODEL_DIR \
+#            --lora_ckpt LORA_DIR --output_root OUT_DIR [--gpus 0,1,2,3] [other flags below]
+# Checkpoints are written to OUTPUT_ROOT/RUN_NAME.
 cd "$(cd $(dirname $0); pwd)/.."
 
-# ======================= Paths: fill these in before running =======================
-# DATASET     training annotation json (schema documented in DATASET.md). A handful of
-#             very long dvc samples dominate peak memory; if they cause OOM, either drop
-#             them from the annotation file or lower BS and raise ACCUM_STEPS.
-# MODEL       audio-augmented Qwen2.5-VL backbone directory
-# MODEL_BASE  base model used for the LoRA merge (normally identical to MODEL)
+# ======================= Paths (or pass as flags, e.g. --dataset) ==================
+# DATASET     training annotation json (see DATASET.md)
+# MODEL       audio-augmented Qwen2.5-VL backbone; MODEL_BASE is normally the same
 # LORA_CKPT   video-SALMONN-2+ LoRA checkpoint, merged into the base at startup
-# OUTPUT_ROOT parent directory for run outputs (checkpoints and the merged model)
-# Each can also be supplied on the command line, e.g. --dataset /path/to/train.json
+# OUTPUT_ROOT parent directory for run outputs
 DATASET=""
 MODEL=""
 MODEL_BASE=""
@@ -34,20 +34,42 @@ MIN_FRAMES=64
 MAX_FRAMES=256
 INTERVAL=0.5
 USE_LORA=True
+READOUT_ONLY=False
 LORA_R=128
+LORA_TARGET=qkv              # qkv, or all (q/k/v/o + MLP)
+NAN_GUARD=False              # abort at the first non-finite loss/grad_norm
+SAVE_TOTAL_LIMIT=5
 LORA_ALPHA=256
 LORA_DROPOUT=0.05
-TRAIN_TYPE=sft
 NUM_WORKER=8
 PREFETCH_FACTOR=2
 PERSISTENT_WORKERS=True
 NO_AUDIO=False
 USE_EVIDENCE=True
-USE_SCORE_HEAD=False
 USE_ATTENTION_HEAD=True
 LOSS_MATCH_WEIGHT=5.0
+LOSS_STOP_WEIGHT=0.0        # relative weight of the planning-stop <S> (<=1 = off)
+LOSS_STOP_SYMMETRIC=False   # also upweight dvc planning <G> positions
+BRANCH_INTERVAL_ATTENTION=False  # dvc branches see only their own interval's media tokens
+BRANCH_INTERVAL_MARGIN=1
+BRANCH_INTERVAL_AUDIO_FULL=False  # confine video only; audio fully visible
+LOSS_CONTRAST_WEIGHT=0.0    # timestep InfoNCE on top of the BCE match loss (0 = off)
+LOSS_CONTRAST_DETACH=True   # contrast gradients reach only the evi/frm heads
+GROUNDING_TARGET_DECAY=1.0   # soft grounding target 0.5^(decay*dist)
+LOSS_IOU_WEIGHT=0.0          # interval soft-IoU loss weight (0 = off)
+GROUNDING_COVERAGE_TRAIN=False # coverage-consistent grounding loss (dvc)
+LOSS_BOUNDARY_WEIGHT=0.0       # start/end boundary-head loss (0 = off)
+GROUNDING_BOUNDARY_DECAY=1.0   # boundary-peak target 0.5^(decay*|t-boundary|)
+LOSS_PLATEAU_WEIGHT=0.0        # plateau-consistency hinge on the inside curve (0 = off)
+GROUNDING_PLATEAU_RATIO=0.7    # match the inference grounding threshold
+LOSS_BOUNDARY_RANK_WEIGHT=0.0  # internal-peak suppression on boundary heads (0 = off)
+GROUNDING_BOUNDARY_RANK_MARGIN=1.0
+SELF_AGGREGATION_PROB=0.0   # scheduled sampling for <G> aggregation (0 = off; not ZeRO-3)
+GROUNDING_THRESHOLD=0.8      # self-aggregation readout; match evaluation
+GROUNDING_MERGE_GAP=2
+GROUNDING_COVERAGE_MASK=False
+GROUNDING_SNAP_WINDOW=0        # >0: snap readout edges with the boundary heads
 AUDIO_MEAN_WEIGHT=1
-UNION_AGGREGATION=False
 AGGREGATION_JITTER=0.1
 USE_FLASHATTENTION=False
 VISION_AUDIO_LAYER_INDEX=6
@@ -84,25 +106,47 @@ while [[ "$#" -gt 0 ]]; do
         --max_frames) MAX_FRAMES="$2"; shift ;;
         --interval) INTERVAL="$2"; shift ;;
         --use_lora) USE_LORA=True ;;
+        --no_lora) USE_LORA=False ;;   # heads-only training, LLM frozen
+        --readout_only) READOUT_ONLY=True ;;   # also freeze the token embeddings (heads only)
         --lora_r) LORA_R="$2"; shift ;;
+        --lora_target) LORA_TARGET="$2"; shift ;;
+        --nan_guard) NAN_GUARD="$2"; shift ;;
+        --save_total_limit) SAVE_TOTAL_LIMIT="$2"; shift ;;
         --lora_alpha) LORA_ALPHA="$2"; shift ;;
         --lora_dropout) LORA_DROPOUT="$2"; shift ;;
         --lora_ckpt) LORA_CKPT="$2"; shift ;;
         --output_root) OUTPUT_ROOT="$2"; shift ;;
-        --train_type) TRAIN_TYPE="$2"; shift ;;
         --num_worker) NUM_WORKER="$2"; shift ;;
         --prefetch_factor) PREFETCH_FACTOR="$2"; shift ;;
         --persistent_workers) PERSISTENT_WORKERS="$2"; shift ;;
         --no_audio) NO_AUDIO=True ;;
         --use_evidence) USE_EVIDENCE=True ;;
         --no_use_evidence) USE_EVIDENCE=False ;;
-        --use_score_head) USE_SCORE_HEAD=True ;;
-        --no_use_score_head) USE_SCORE_HEAD=False ;;
         --use_attention_head) USE_ATTENTION_HEAD=True ;;
         --no_use_attention_head) USE_ATTENTION_HEAD=False ;;
         --loss_match_weight) LOSS_MATCH_WEIGHT="$2"; shift ;;
+        --loss_stop_weight) LOSS_STOP_WEIGHT="$2"; shift ;;
+        --loss_stop_symmetric) LOSS_STOP_SYMMETRIC="$2"; shift ;;
+        --branch_interval_attention) BRANCH_INTERVAL_ATTENTION="$2"; shift ;;
+        --branch_interval_margin) BRANCH_INTERVAL_MARGIN="$2"; shift ;;
+        --branch_interval_audio_full) BRANCH_INTERVAL_AUDIO_FULL="$2"; shift ;;
+        --loss_contrast_weight) LOSS_CONTRAST_WEIGHT="$2"; shift ;;
+        --loss_contrast_detach) LOSS_CONTRAST_DETACH="$2"; shift ;;
+        --grounding_target_decay) GROUNDING_TARGET_DECAY="$2"; shift ;;
+        --loss_iou_weight) LOSS_IOU_WEIGHT="$2"; shift ;;
+        --grounding_coverage_train) GROUNDING_COVERAGE_TRAIN="$2"; shift ;;
+        --grounding_snap_window) GROUNDING_SNAP_WINDOW="$2"; shift ;;
+        --loss_boundary_weight) LOSS_BOUNDARY_WEIGHT="$2"; shift ;;
+        --grounding_boundary_decay) GROUNDING_BOUNDARY_DECAY="$2"; shift ;;
+        --loss_plateau_weight) LOSS_PLATEAU_WEIGHT="$2"; shift ;;
+        --grounding_plateau_ratio) GROUNDING_PLATEAU_RATIO="$2"; shift ;;
+        --loss_boundary_rank_weight) LOSS_BOUNDARY_RANK_WEIGHT="$2"; shift ;;
+        --grounding_boundary_rank_margin) GROUNDING_BOUNDARY_RANK_MARGIN="$2"; shift ;;
+        --self_aggregation_prob) SELF_AGGREGATION_PROB="$2"; shift ;;
+        --grounding_threshold) GROUNDING_THRESHOLD="$2"; shift ;;
+        --grounding_merge_gap) GROUNDING_MERGE_GAP="$2"; shift ;;
+        --grounding_coverage_mask) GROUNDING_COVERAGE_MASK="$2"; shift ;;
         --audio_mean_weight) AUDIO_MEAN_WEIGHT="$2"; shift ;;
-        --union_aggregation) UNION_AGGREGATION="$2"; shift ;;
         --aggregation_jitter) AGGREGATION_JITTER="$2"; shift ;;
         --use_flashattention) USE_FLASHATTENTION=True ;;
         --no_use_flashattention) USE_FLASHATTENTION=False ;;
@@ -116,7 +160,7 @@ done
 # Derived after parsing so that --gpus takes effect
 NGPUS=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
 
-# Fail early with a precise message instead of letting an empty path reach torchrun
+# Check required paths
 MISSING=""
 [ -z "$DATASET" ]     && MISSING="${MISSING} DATASET(--dataset)"
 [ -z "$MODEL" ]       && MISSING="${MISSING} MODEL(--model)"
@@ -136,7 +180,7 @@ fi
 OUTPUT_DIR=${OUTPUT_ROOT}/${RUN_NAME}
 mkdir -p "$OUTPUT_DIR"
 
-# Pick a free port automatically to avoid clashing with other training/testing jobs
+# Pick a free port
 MASTER_PORT=$(python3 - <<'PYEOF'
 import random, socket
 def free(p):
@@ -175,7 +219,7 @@ torchrun --nproc_per_node=${NGPUS} --nnodes=1 --node_rank=0 --master_addr=127.0.
         --eval_strategy "no" \
         --save_strategy "steps" \
         --save_steps $SAVE_STEPS \
-        --save_total_limit 5 \
+        --save_total_limit $SAVE_TOTAL_LIMIT \
         --learning_rate $LR \
         --weight_decay 0 \
         --warmup_ratio 0.03 \
@@ -194,20 +238,41 @@ torchrun --nproc_per_node=${NGPUS} --nnodes=1 --node_rank=0 --master_addr=127.0.
         --base_interval $INTERVAL \
         --model_base $MODEL_BASE \
         --use_lora $USE_LORA \
+        --readout_only $READOUT_ONLY \
         --lora_r $LORA_R \
+        --lora_target $LORA_TARGET \
+        --nan_guard $NAN_GUARD \
         --lora_alpha $LORA_ALPHA \
         --lora_dropout $LORA_DROPOUT \
         --lora_ckpt $LORA_CKPT \
-        --train_type $TRAIN_TYPE \
         --tune_mm_audio $TRAIN_AUDIO \
         --tune_mm_qformer $TRAIN_QFORMER \
         --no_audio $NO_AUDIO \
         $([ "$USE_EVIDENCE" = "True" ] && echo "--use_evidence") \
-        --use_score_head $USE_SCORE_HEAD \
         --use_attention_head $USE_ATTENTION_HEAD \
         --loss_match_weight $LOSS_MATCH_WEIGHT \
+        --loss_stop_weight $LOSS_STOP_WEIGHT \
+        --loss_stop_symmetric $LOSS_STOP_SYMMETRIC \
+        --branch_interval_attention $BRANCH_INTERVAL_ATTENTION \
+        --branch_interval_margin $BRANCH_INTERVAL_MARGIN \
+        --branch_interval_audio_full $BRANCH_INTERVAL_AUDIO_FULL \
+        --loss_contrast_weight $LOSS_CONTRAST_WEIGHT \
+        --loss_contrast_detach $LOSS_CONTRAST_DETACH \
+        --grounding_target_decay $GROUNDING_TARGET_DECAY \
+        --loss_iou_weight $LOSS_IOU_WEIGHT \
+        --grounding_coverage_train $GROUNDING_COVERAGE_TRAIN \
+        --grounding_snap_window $GROUNDING_SNAP_WINDOW \
+        --loss_boundary_weight $LOSS_BOUNDARY_WEIGHT \
+        --grounding_boundary_decay $GROUNDING_BOUNDARY_DECAY \
+        --loss_plateau_weight $LOSS_PLATEAU_WEIGHT \
+        --grounding_plateau_ratio $GROUNDING_PLATEAU_RATIO \
+        --loss_boundary_rank_weight $LOSS_BOUNDARY_RANK_WEIGHT \
+        --grounding_boundary_rank_margin $GROUNDING_BOUNDARY_RANK_MARGIN \
+        --self_aggregation_prob $SELF_AGGREGATION_PROB \
+        --grounding_threshold $GROUNDING_THRESHOLD \
+        --grounding_merge_gap $GROUNDING_MERGE_GAP \
+        --grounding_coverage_mask $GROUNDING_COVERAGE_MASK \
         --audio_mean_weight $AUDIO_MEAN_WEIGHT \
-        --union_aggregation $UNION_AGGREGATION \
         --aggregation_jitter_ratio $AGGREGATION_JITTER \
         --use_flashattention $USE_FLASHATTENTION \
         --vision_audio_layer_index $VISION_AUDIO_LAYER_INDEX \

@@ -1,15 +1,15 @@
+# Run PadCaptioner inference on an annotation file, sharded across GPUs (one process per GPU).
+# Usage: bash scripts_run/test.sh --dataset TEST.json --model MERGED_MODEL_DIR --output_root OUT_DIR \
+#            [--run_name NAME] [--gpus 0,1] [inference flags below]
+# Per-rank predictions are written to OUTPUT_ROOT/RUN_NAME/test_results_rank*.json.
 cd "$(cd $(dirname $0); pwd)/.."
 
 
-# ======================= Paths: fill these in before running =======================
-# DATASET     evaluation annotation json (same schema as training; see README.md)
-# MODEL       merged model directory (pytorch_model.bin + config.json + tokenizer).
-#             With USE_EVIDENCE=True this must NOT be a checkpoint-N subdirectory —
-#             checkpoints only hold the LoRA adapter and DeepSpeed shards. Convert one
-#             first with my_tools/convert_checkpoint_to_model.py.
-# MODEL_BASE  audio-augmented Qwen2.5-VL backbone directory
-# OUTPUT_ROOT parent directory for results (a per-run subdirectory is created below)
-# Each can also be supplied on the command line, e.g. --model /path/to/model
+# ======================= Paths (or pass as flags, e.g. --model) =====================
+# DATASET     evaluation annotation json (same schema as training)
+# MODEL       merged model directory, or a run dir whose latest checkpoint-N is auto-converted
+# MODEL_BASE  directory holding the image-processor config; defaults to MODEL (the released model ships it)
+# OUTPUT_ROOT parent directory for results
 DATASET=""
 MODEL=""
 MODEL_BASE=""
@@ -30,12 +30,28 @@ LORA_CKPT=No
 NUM_SAMPLE=1
 DO_SAMPLE=False
 NO_AUDIO=False
-GROUNDING_MERGE_GAP=2
-GROUNDING_SELECT=mass
+GROUNDING_MERGE_GAP=0        # bridge salient runs separated by <= this many timesteps
+GROUNDING_SNAP_WINDOW=1      # snap interval ends to boundary-head peaks within +-N steps (0 = off)
+GROUNDING_SNAP_TASKS="dvc"  # tasks to snap; empty = all
 USE_EVIDENCE=True
 USE_FLASHATTENTION=False
 GROUNDING_THRESHOLD=0.7
 DEINTERLEAVE=True
+# Inference options (defaults = the settings used to evaluate the released model; see argument.py)
+MAX_PLANNING_EVENTS=24    # dvc: max planned events
+GROUNDING_COVERAGE_MASK=True   # dvc: mask already-claimed timesteps during planning readout
+BRANCH_INTERVAL_ATTENTION=True   # dvc: branches see only their own interval's media tokens (must match training)
+BRANCH_INTERVAL_MARGIN=1
+BRANCH_INTERVAL_AUDIO_FULL=True   # confine video only; audio fully visible
+MIN_BODY_TOKENS=8         # t2v/t2a/v2a/a2v: min body tokens after <G> (0 = off)
+DVC_DEDUP_IOU=0.75        # dvc: NMS IoU threshold over records (0 = off)
+SRC_INTERVAL_OVERRIDE=True   # t2v/t2a: echo the given src interval instead of the readout
+TASK_AUDIO_MEAN_WEIGHT="v2t=0.0"  # per-task audio weight in the aggregated <G> feature
+ECHO_BEST_OF_N=4             # v2a/a2v: resample up to N times when the body echoes the prompt (0 = off)
+ECHO_OVERLAP_THRESHOLD=0.15  # early-accept overlap threshold for the echo check
+SINGLE_EVENT_NO_REPLAN=True  # single-event tasks: ban a second <G>/<S> after the first <G>
+TASK_MAX_BODY_TOKENS="t2a=90,v2a=90,t2v=45,a2v=45"   # cap generated body tokens per task (empty = 1024)
+DEGENERATE_RETRY=4           # resample degenerate single-event bodies up to N times (0 = off)
 
 export CUDA_VISIBLE_DEVICES=0
 export ARNOLD_ID=0
@@ -70,7 +86,22 @@ while [[ "$#" -gt 0 ]]; do
         --no_use_evidence) USE_EVIDENCE=False ;;
         --grounding_threshold) GROUNDING_THRESHOLD="$2"; shift ;;
         --grounding_merge_gap) GROUNDING_MERGE_GAP="$2"; shift ;;
-        --grounding_select) GROUNDING_SELECT="$2"; shift ;;
+        --grounding_snap_window) GROUNDING_SNAP_WINDOW="$2"; shift ;;
+        --grounding_snap_tasks) GROUNDING_SNAP_TASKS="$2"; shift ;;
+        --max_planning_events) MAX_PLANNING_EVENTS="$2"; shift ;;
+        --grounding_coverage_mask) GROUNDING_COVERAGE_MASK="$2"; shift ;;
+        --branch_interval_attention) BRANCH_INTERVAL_ATTENTION="$2"; shift ;;
+        --branch_interval_margin) BRANCH_INTERVAL_MARGIN="$2"; shift ;;
+        --branch_interval_audio_full) BRANCH_INTERVAL_AUDIO_FULL="$2"; shift ;;
+        --min_body_tokens) MIN_BODY_TOKENS="$2"; shift ;;
+        --dvc_dedup_iou) DVC_DEDUP_IOU="$2"; shift ;;
+        --src_interval_override) SRC_INTERVAL_OVERRIDE="$2"; shift ;;
+        --task_audio_mean_weight) TASK_AUDIO_MEAN_WEIGHT="$2"; shift ;;
+        --echo_best_of_n) ECHO_BEST_OF_N="$2"; shift ;;
+        --echo_overlap_threshold) ECHO_OVERLAP_THRESHOLD="$2"; shift ;;
+        --single_event_no_replan) SINGLE_EVENT_NO_REPLAN="$2"; shift ;;
+        --task_max_body_tokens) TASK_MAX_BODY_TOKENS="$2"; shift ;;
+        --degenerate_retry) DEGENERATE_RETRY="$2"; shift ;;
         --port_base) PORT_BASE="$2"; shift ;;
         --no_deinterleave) DEINTERLEAVE=False ;;
         --deinterleave) DEINTERLEAVE=True ;;
@@ -84,11 +115,11 @@ done
 NGPUS=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
 IFS=',' read -r -a GPU_LIST <<< "$CUDA_VISIBLE_DEVICES"
 
-# Fail early with a precise message instead of letting an empty path reach torchrun
+# Check required paths
 MISSING=""
 [ -z "$DATASET" ]     && MISSING="${MISSING} DATASET(--dataset)"
 [ -z "$MODEL" ]       && MISSING="${MISSING} MODEL(--model)"
-[ -z "$MODEL_BASE" ]  && MISSING="${MISSING} MODEL_BASE(--model_base)"
+[ -z "$MODEL_BASE" ]  && MODEL_BASE="$MODEL"
 [ -z "$OUTPUT_ROOT" ] && MISSING="${MISSING} OUTPUT_ROOT(--output_root)"
 if [ -n "$MISSING" ]; then
     echo "[test] FAILED: unset path(s):${MISSING}" >&2
@@ -100,12 +131,12 @@ if [ ! -f "$DATASET" ]; then
     exit 1
 fi
 
-# Per-run working directory: input shards + logs + result files all live here
+# Per-run directory for shards, logs and results
 RUN_DIR=${OUTPUT_ROOT}/${RUN_NAME}
 SPLIT_DIR=${RUN_DIR}/splits
 mkdir -p "$SPLIT_DIR"
 
-# If unset, auto-pick NGPUS consecutive free ports to avoid clashes between concurrent tests
+# Pick NGPUS consecutive free ports unless --port_base is given
 if [ -z "$PORT_BASE" ]; then
     PORT_BASE=$(python3 - "$NGPUS" <<'PYEOF'
 import random, socket, sys
@@ -175,7 +206,22 @@ for i in $(seq 0 $((${NGPUS}-1))); do
             --no_audio $NO_AUDIO \
             --grounding_threshold $GROUNDING_THRESHOLD \
             --grounding_merge_gap $GROUNDING_MERGE_GAP \
-            --grounding_select $GROUNDING_SELECT \
+            --grounding_snap_window $GROUNDING_SNAP_WINDOW \
+            ${GROUNDING_SNAP_TASKS:+--grounding_snap_tasks $GROUNDING_SNAP_TASKS} \
+            --max_planning_events $MAX_PLANNING_EVENTS \
+            --grounding_coverage_mask $GROUNDING_COVERAGE_MASK \
+            --branch_interval_attention $BRANCH_INTERVAL_ATTENTION \
+            --branch_interval_margin $BRANCH_INTERVAL_MARGIN \
+            --branch_interval_audio_full $BRANCH_INTERVAL_AUDIO_FULL \
+            --min_body_tokens $MIN_BODY_TOKENS \
+            --dvc_dedup_iou $DVC_DEDUP_IOU \
+            --src_interval_override $SRC_INTERVAL_OVERRIDE \
+            --task_audio_mean_weight "$TASK_AUDIO_MEAN_WEIGHT" \
+            --echo_best_of_n $ECHO_BEST_OF_N \
+            --echo_overlap_threshold $ECHO_OVERLAP_THRESHOLD \
+            --single_event_no_replan $SINGLE_EVENT_NO_REPLAN \
+            --task_max_body_tokens "$TASK_MAX_BODY_TOKENS" \
+            --degenerate_retry $DEGENERATE_RETRY \
             --use_flashattention $USE_FLASHATTENTION \
             --deinterleave_parallel_output $DEINTERLEAVE \
             $([ "$USE_EVIDENCE" = "True" ] && echo "--use_evidence" || echo "") > "$SHARD_LOG" 2>&1 &

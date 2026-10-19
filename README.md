@@ -64,10 +64,11 @@ conda create -n padcaptioner python=3.12
 conda activate padcaptioner
 ```
 
-3. Install dependencies:
+3. Install dependencies. FFmpeg is needed by torchcodec for video/audio decoding, and Java by pycocoevalcap for the METEOR metric:
 
 ```bash
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+conda install -c conda-forge ffmpeg openjdk
+pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 ```
 
@@ -100,12 +101,34 @@ Please refer to **[DATASET.md](DATASET.md)** for raw dataset links, annotation p
 
 1. Download the [pretrained model](https://huggingface.co/wenzhengzeng/PadCaptioner-3B).
 
-2. Fill in the path block at the top of `scripts_run/test.sh` (`DATASET`, `MODEL`, `MODEL_BASE`, `OUTPUT_ROOT`), or pass them as flags.
-
-   For ChronusAV:
+2. Download the test annotations from [PadCaptioner-Data](https://huggingface.co/datasets/wenzhengzeng/PadCaptioner-Data) (`ChronusAV/test_dvc2000.json` for dense video captioning, or `ChronusAV/test.json` for all seven tasks) and the ChronusAV test videos, then point the annotations at your videos:
 
    ```bash
-   bash scripts_run/test.sh --dataset /path/to/chronusav_test.json
+   python my_tools/relocate_video_paths.py \
+       --anno /path/to/test_dvc2000.json \
+       --video_dir /path/to/videos \
+       --out_dir /path/to/annotations
+   ```
+
+3. Fill in the path block at the top of `scripts_run/test.sh` (`DATASET`, `MODEL`, `OUTPUT_ROOT`), or pass them as flags:
+
+   ```bash
+   bash scripts_run/test.sh \
+       --dataset /path/to/annotations/test_dvc2000.json \
+       --model /path/to/PadCaptioner-3B \
+       --output_root /path/to/output \
+       --run_name dvc2000 \
+       --gpus 0,1
+   ```
+
+   Predictions are written to `/path/to/output/dvc2000/test_results_rank*.json`.
+
+4. Compute the metrics:
+
+   ```bash
+   python my_tools/etbench_dvc_metrics.py \
+       --run_dir /path/to/output/dvc2000 \
+       --gt /path/to/annotations/test_dvc2000.json
    ```
 
 ## 🙏 Acknowledgments

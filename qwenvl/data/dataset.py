@@ -58,7 +58,7 @@ def read_jsonl(path):
     with open(path, "r") as f:
         return [json.loads(line) for line in f]
 
-def split_into_groups(counts, groups, second_per_grid_ts=None): # counts: audio token counts (1 token per 0.5s, rounded up per 30s chunk); groups: number of video frames; second_per_grid_ts: seconds per frame (already scaled by 2 to account for pooling)
+def split_into_groups(counts, groups, second_per_grid_ts=None): # split audio token counts across video timesteps
     result = []
     if second_per_grid_ts is None:
         for count, g in zip(counts, groups):
@@ -80,10 +80,10 @@ def split_into_groups(counts, groups, second_per_grid_ts=None): # counts: audio 
     else:
         for count, g, second in zip(counts, groups, second_per_grid_ts):
             g = g.item()
-            frame_idx = (torch.arange(g) * second * 2).long()   # audio token index per timestep (x2 since audio rate is one token per 0.5s)
-            per_grid_t = torch.diff(frame_idx)  # difference of adjacent indices = audio tokens assigned to timestep i
+            frame_idx = (torch.arange(g) * second * 2).long()   # audio token index per timestep (one token per 0.5s)
+            per_grid_t = torch.diff(frame_idx)
             group_list = per_grid_t.tolist()
-            group_list.append(count - sum(group_list))  # remaining tokens go to the last timestep (diff drops one element)
+            group_list.append(count - sum(group_list))  # remainder goes to the last timestep
             result.append(group_list)
     return result
 
@@ -100,14 +100,14 @@ def generate_id_target(
 ):
     visual_replicate_index_image = 0
     visual_replicate_index_video = 0
-    roles = {"human": "user", "gpt": "assistant", "chosen": "assistant", "reject": "assistant"}
+    roles = {"human": "user", "gpt": "assistant"}
     system_message = "You are a helpful assistant."
     input_id, target = [], []
 
     input_id += tokenizer.apply_chat_template(
         [{"role": "system", "content": system_message}]
-    )   # input_id step1: tokenize the system prompt ('<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n')
-    target += [IGNORE_INDEX] * len(input_id) # target step1: system prompt tokens are all IGNORE (-100)
+    )   # system prompt
+    target += [IGNORE_INDEX] * len(input_id)
     for conv in source:
         try:
             role = conv["role"]
@@ -134,9 +134,9 @@ def generate_id_target(
                     new_parts.append(replacement)
                 new_parts.append(parts[-1])
                 content = "".join(new_parts)
-            ############################################################################################ build interleaved video-audio placeholders
+            # Interleaved video/audio placeholders
             if "<video>" in content:
-                parts = content.split("<video>")    # split text on the video placeholder
+                parts = content.split("<video>")
                 new_parts = []
                 if audio_lengths is None:
                     grid_thw_video = [
@@ -157,9 +157,9 @@ def generate_id_target(
                 else: # interleave video and audio tokens per timestep
                     for i in range(len(parts) - 1):
                         new_parts.append(parts[i])
-                        if second_per_grid_ts is None: # no second_per_grid_ts: distribute audio tokens by frame count
-                            per_timestep_audio_len = split_into_groups(audio_lengths, [grid_thw_video[i][0] for i in range(len(grid_thw_video))]) # per_timestep_audio_len: audio tokens assigned to each timestep
-                        else: # otherwise distribute audio tokens by time interval
+                        if second_per_grid_ts is None: # distribute audio tokens by frame count
+                            per_timestep_audio_len = split_into_groups(audio_lengths, [grid_thw_video[i][0] for i in range(len(grid_thw_video))])
+                        else: # distribute audio tokens by time
                             per_timestep_audio_len = split_into_groups(audio_lengths, [grid_thw_video[i][0] for i in range(len(grid_thw_video))], [ts[0] for ts in second_per_grid_ts])
                         replacement = "<|vision_start|>"
                         for timestep in range(grid_thw_video[i][0]):
@@ -168,12 +168,11 @@ def generate_id_target(
                                 * (grid_thw_video[i][1] * grid_thw_video[i][2] // merge_size**2)
                                 + f"<|audio_pad|>"
                                 * per_timestep_audio_len[i][timestep]
-                            )   # interleave: video tokens of the current frame, then the audio tokens assigned between frames
+                            )   # frame's video tokens, then its audio tokens
                         replacement += "<|vision_end|>"
-                        new_parts.append(replacement)   # overall: <|vision_start|> followed by token-level interleaved <|video_pad|>/<|audio_pad|> placeholders for omni tokens
+                        new_parts.append(replacement)
                     new_parts.append(parts[-1])
                     content = "".join(new_parts)
-            ############################################################################################
 
             if "<audio>" in content:
                 parts = content.split("<audio>")
@@ -181,7 +180,7 @@ def generate_id_target(
                 for i in range(len(parts) - 1):
                     new_parts.append(parts[i])
                     replacement = (
-                        "<|vision_start|>" # no need to train more start token
+                        "<|vision_start|>" # reuse the vision start token
                         + f"<|audio_pad|>"
                         * audio_lengths[i]
                         + "<|vision_end|>"
@@ -191,40 +190,33 @@ def generate_id_target(
                 content = "".join(new_parts)
         conv = [{"role": role, "content": content}]
 
-        encode_id = tokenizer.apply_chat_template(conv) # tokenize this conversation turn
-        parallel_pad_flags = None   # marks filler positions in parallel segments (True = filler, label set to IGNORE)
+        encode_id = tokenizer.apply_chat_template(conv)
+        parallel_pad_flags = None   # True at branch filler positions (label IGNORE)
         if role == "assistant" and gpt_value_segments:
-            # parallel processing
-            # step1: get the id of the parallel divider token
+            # Parallel dvc answer: split on <shift>, pad branches to equal length and interleave them
             divide_id = tokenizer.encode("<shift>")[0]
 
-            # step2: split the content (encode_id_parts: [0]: system + serial evi, [1]: parallel evi, [2]..[len(gpt_value_segments)+1]: parallel answers)
+            # parts: [0] serial planning, [1] anchors, [2:] per-event captions
             split_indices = [i for i, t in enumerate(encode_id) if t == divide_id]
             start = 0
             encode_id_parts = []
             for i in split_indices:
                 encode_id_parts.append(encode_id[start:i])
                 start = i + 1
-            encode_id_parts.append(encode_id[start:])   # parts exclude the shift token itself (only used as a divider during data preparation)
+            encode_id_parts.append(encode_id[start:])
 
             end_suffix_ids = tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
             if len(encode_id_parts) - 1 >= 2:
                 for i in range(2, len(encode_id_parts) - 1):
-                    encode_id_parts[i] = encode_id_parts[i] + end_suffix_ids   # append <|im_end|>\n to each parallel caption except the last one, which already ends with it
+                    encode_id_parts[i] = encode_id_parts[i] + end_suffix_ids   # the last caption already ends with it
 
-            # step3: pad the answer parts [2]..[len(gpt_value_segments)+1] to the same length and transpose.
-            # Filler token is <|im_end|> (matches the placeholder fed to finished branches at
-            # inference), and filler positions get IGNORE labels (see target construction below).
-            # Rationale: computing loss on filler positions teaches the model to emit fillers;
-            # with K>1 branches of very different caption lengths this dominates the parallel
-            # supervision and makes branches terminate right after the anchor. Each branch's
-            # real termination signal is its own trailing <|im_end|>\n, which is unaffected.
+            # Pad captions with <|im_end|> (as fed to finished branches at inference); fillers get no loss
             branch_filler_id = end_suffix_ids[0]   # <|im_end|>
-            pad_end = min(len(gpt_value_segments) + 2, len(encode_id_parts))    # index+1 of the last part to pad (relative to encode_id_parts); the two operands should be equal, min() is just a bounds guard, and the value works directly as a slice end
+            pad_end = min(len(gpt_value_segments) + 2, len(encode_id_parts))    # min() is a bounds guard
             if pad_end > 2:
-                segment = encode_id_parts[2:pad_end] # only parts from index 2 onward need parallel padding
-                max_len = max(len(p) for p in segment)  # token count of the longest caption
-                # build filler-position flags alongside the tokens (filler is <|im_end|>, indistinguishable from real end tokens by value, so positions must be flagged)
+                segment = encode_id_parts[2:pad_end]
+                max_len = max(len(p) for p in segment)
+                # Fillers equal real <|im_end|> by value, so flag them by position
                 filler_flags = [[False] * len(p) + [True] * (max_len - len(p)) for p in segment]
                 encode_id_parts[2:pad_end] = [p + [branch_filler_id] * (max_len - len(p)) for p in segment]
 
@@ -234,40 +226,35 @@ def generate_id_target(
                 encode_id = (encode_id_parts[0] + [divide_id] + encode_id_parts[1] + transposed)
                 parallel_pad_flags = [False] * (len(encode_id_parts[0]) + 1 + len(encode_id_parts[1])) + transposed_flags
             else:
-                # no transposition needed: concatenate as-is (other tasks, i.e. a single event)
+                # Single event: concatenate as is
                 encode_id = encode_id_parts[0]
                 for part in encode_id_parts[1:]:
                     encode_id += [divide_id] + part
 
-        input_id += encode_id   # input_id step2: append the tokenized turn (with interleaved video/audio placeholders)
+        input_id += encode_id
         if role in ["user", "system"]:
-            target += [IGNORE_INDEX] * len(encode_id)   # target step2: no loss on the question part (all -100)
+            target += [IGNORE_INDEX] * len(encode_id)   # no loss on the question
         else:
             target_mask = encode_id.copy()
-            target_mask[:3] = [IGNORE_INDEX] * 3    # response starts with <|im_start|>assistant\n (3 tokens), no loss on those
-            # filler positions in parallel segments get no loss: avoids spurious "emit filler" supervision diluting the real caption signal
+            target_mask[:3] = [IGNORE_INDEX] * 3    # <|im_start|>assistant\n
             if parallel_pad_flags is not None:
                 target_mask = [IGNORE_INDEX if flag else t for t, flag in zip(target_mask, parallel_pad_flags)]
-            target += target_mask # target step3: response tokens are the targets, except the first 3 (<|im_start|>assistant\n)
+            target += target_mask
     return input_id, target
 
 
 def generate_event_id(input_id: List[int], target: List[int], divide_id: int, event_num: int) -> Tuple[torch.Tensor, List[int], List[int]]:
+    """Remove the first divide_id (<shift>) and label each token with its event (-1 = shared prefix).
+
+    Returns (event_id LongTensor, input_id, target).
     """
-    Build an event_id sequence (same length as input_id) marking which event/segment each token belongs to.
-    divide_id: token id of the parallel divider (e.g. <shift>) used to split segments in input_id.
-    event_num: number of parallel events, i.e. len(gpt_value_segments).
-    Returns event_id as torch.Tensor (dtype=long); input_id and target remain lists.
-    """
-    # step1: locate the divider to get the prefix length in input_id
-    divide_index = input_id.index(divide_id)    # first occurrence of the divider
+    divide_index = input_id.index(divide_id)
     prefix_length = divide_index
 
-    # step2: remove the divide_id at divide_index from input_id and target (in place, avoiding slice copies)
     input_id.pop(divide_index)
     target.pop(divide_index)
 
-    # step3: init event_id with -1, then from prefix_length fill 0,1,...,event_num-1 cyclically, and convert to tensor
+    # Interleaved branch tokens cycle through events 0..event_num-1
     n = len(input_id)
     suffix_len = n - prefix_length
     
@@ -276,12 +263,12 @@ def generate_event_id(input_id: List[int], target: List[int], divide_id: int, ev
         event_id = torch.tensor(
             [-1] * prefix_length + [i % event_num for i in range(suffix_len)],
             dtype=torch.long,
-        )   # event ids start from 0
+        )
     else:
          event_id = torch.tensor(
             [-1] * (prefix_length-event_num) + [i % event_num for i in range(suffix_len+event_num)],
             dtype=torch.long,
-        )   # event ids start from 0
+        )
     return event_id, input_id, target
 
 
@@ -290,27 +277,22 @@ def adjust_position_ids_for_parallel(
     event_id: Union[List[int], torch.Tensor],
     event_num: int,
 ) -> torch.Tensor:
+    """Give each parallel branch its own positions continuing from the parallel start.
+
+    position_ids: (3, batch_size, seq_len); event_id: -1 for the prefix, else the branch index.
     """
-    Rewrite position_ids for the parallel part so that each parallel segment gets its
-    own independent position encoding.
-    position_ids: (3, batch_size, seq_len); dim 0 is time / height / width
-    event_id: list or 1D tensor of length seq_len; -1 = prefix, 0..event_num-1 = parallel segment (required)
-    event_num: number of parallel events, equals len(gpt_value_segments)
-    """
-    # step1: build the parallel mask
     device = position_ids.device
     dtype = position_ids.dtype
     event_id_t = torch.as_tensor(event_id, dtype=torch.long).to(device)
     parallel_mask = event_id_t >= 0
 
-    # step2: get the position at the parallel start index (3D coords of position_ids there, shape (3, batch_size))
     parallel_start_idx = torch.where(parallel_mask)[0][0]
     parallel_start_position = position_ids[:, :, parallel_start_idx]  # (3, batch_size)
 
-    if not parallel_mask.any(): # reached by non-DVC tasks under the parallel setting
+    if not parallel_mask.any():
         return position_ids
 
-    # step3: from the parallel start, every event_num tokens share one position id; ids increase by 1 per group
+    # Every event_num consecutive tokens share one position
     parallel_indices = torch.where(parallel_mask)[0]  # (num_parallel,)
     position_in_parallel = (parallel_indices - parallel_start_idx).to(dtype).to(device)
     segment_indices = (position_in_parallel // event_num).view(1, 1, -1)  # (1, 1, num_parallel)
@@ -326,7 +308,7 @@ def find_2th_index(lst, x):
             count += 1
             if count == 2:
                 return i
-    return None  # fewer than 2 occurrences
+    return None
 
 def preprocess_qwen_2_visual(
     sources,
@@ -344,11 +326,9 @@ def preprocess_qwen_2_visual(
     chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
     tokenizer.chat_template = chat_template
 
-    input_ids, targets, chosen_ids, chosen_targets, reject_ids, reject_targets, last_text_token_indices = [], [], [], [], [], [], []
-    event_id = None # parallel setting only
+    input_ids, targets, last_text_token_indices = [], [], []
+    event_id = None # parallel (dvc) samples only
 
-    # step1: apply the chat template to produce token ids and targets with interleaved placeholders resolved
-    is_dpo_data = False
     for i, source in enumerate(sources):
         try:
             if source[0]["from"] != "human":
@@ -358,8 +338,7 @@ def preprocess_qwen_2_visual(
 
         input_id, target = generate_id_target(source, grid_thw_image, grid_thw_video, audio_lengths, tokenizer, "gpt", merge_size, second_per_grid_ts, gpt_value_segments)
 
-        # build the event id for each sample
-        if gpt_value_segments:  # parallel setting:
+        if gpt_value_segments:  # parallel dvc sample
             divide_id = tokenizer.encode("<shift>")[0]
             event_id, input_id, target = generate_event_id(input_id, target, divide_id, len(gpt_value_segments))
 
@@ -370,19 +349,9 @@ def preprocess_qwen_2_visual(
     input_ids = torch.tensor(input_ids, dtype=torch.long)
     targets = torch.tensor(targets, dtype=torch.long)
     last_text_token_indices = torch.tensor(last_text_token_indices, dtype=torch.long)
-    chosen_ids = None
-    chosen_targets = None
-    reject_ids = None
-    reject_targets = None
-
-    
     return dict(
         input_ids=input_ids,
         labels=targets,
-        chosen_ids=chosen_ids,
-        chosen_labels=chosen_targets,
-        reject_ids=reject_ids,
-        reject_labels=reject_targets,
         event_id=event_id,
         last_text_token_indices=last_text_token_indices,
     )
@@ -393,10 +362,10 @@ class LazySupervisedDataset(Dataset):
 
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args, model_args=None):
         super(LazySupervisedDataset, self).__init__()
-        # use_evidence lives in ModelArguments, not DataArguments
+        # use_evidence lives in ModelArguments
         self.use_evidence = getattr(model_args, 'use_evidence', False) if model_args else False
 
-        dataset = data_args.dataset_use.split(",") #'/storage/wenzheng/dataset/LongVALE/train/video_salmoon_omni_only_converted.json'
+        dataset = data_args.dataset_use.split(",")
         dataset_list = dataset
         rank0_print(f"Loading datasets: {dataset_list}")
         self.video_max_total_pixels = getattr(
@@ -433,7 +402,8 @@ class LazySupervisedDataset(Dataset):
 
         rank0_print(f"Total training samples: {len(list_data_dict)}")
 
-        random.shuffle(list_data_dict)  # Randomly shuffle the data for training
+
+        random.shuffle(list_data_dict)
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -534,7 +504,7 @@ class LazySupervisedDataset(Dataset):
 
     def process_video(self, video_file):
         torchcodec_video = None
-        try:    # taken when torchcodec is installed
+        try:    # torchcodec first, decord as fallback
             torchcodec_video = self.video_torchcodec(video_file)
             return torchcodec_video
         except:
@@ -560,13 +530,13 @@ class LazySupervisedDataset(Dataset):
         video = vr.get_batch(frame_idx).asnumpy().transpose(0, 3, 1, 2)
         return self.process_video_frames(video, frame_idx, video_length)
 
-    def video_torchcodec(self, video_file):  # returns video data sampled at a fixed time interval
-        device = "cpu"  # or e.g. "cuda"
+    def video_torchcodec(self, video_file):  # sample frames every base_interval seconds
+        device = "cpu"
         decoder = VideoDecoder(video_file, device=device)
         total_frames = decoder.metadata.num_frames
         avg_fps = decoder.metadata.average_fps
         video_length = total_frames / avg_fps
-        interval = getattr(self.data_args, "base_interval", 4)   # default interval 4s (0.5s in actual training)
+        interval = getattr(self.data_args, "base_interval", 4)
 
         num_frames_to_sample = round(video_length / interval)
         video_min_frames = getattr(self.data_args, "video_min_frames", 4)
@@ -586,7 +556,7 @@ class LazySupervisedDataset(Dataset):
         processor = copy.deepcopy(self.data_args.image_processor)
         video_max_frames = getattr(self.data_args, "video_max_frames", 8)
         new_pixel = self.data_args.video_max_frame_pixels
-        if len(frame_idx) < video_max_frames:  # fewer frames than the max: scale pixel budget proportionally
+        if len(frame_idx) < video_max_frames:  # fewer frames: raise the per-frame pixel budget
             new_pixel = 0.95 * video_max_frames / len(frame_idx) * new_pixel
         processor.max_pixels = new_pixel
         processor.min_pixels = self.data_args.video_min_frame_pixels
@@ -595,11 +565,11 @@ class LazySupervisedDataset(Dataset):
         video_processed = processor.preprocess(
             images=None, videos=video, return_tensors="pt"
         )
-        video_tensor = video_processed["pixel_values_videos"] # processed video tensor, shape [t*h*w, channels]
-        grid_thw = video_processed["video_grid_thw"][0] # video grid info: (temporal blocks, height grids, width grids)
+        video_tensor = video_processed["pixel_values_videos"] # [t*h*w, channels]
+        grid_thw = video_processed["video_grid_thw"][0] # (t, h, w)
         second_per_grid_ts = [
             self.data_args.image_processor.temporal_patch_size / fps
-        ] * len(grid_thw)  # seconds per temporal grid
+        ] * len(grid_thw)  # seconds per temporal block
         return video_tensor, grid_thw, second_per_grid_ts
 
     def get_video_token_indices_by_time_range(
@@ -610,88 +580,59 @@ class LazySupervisedDataset(Dataset):
         second_per_grid_ts: List[float],
         spatial_merge_size: int = 2,
     ) -> List[Tuple[int, int]]:
-        """
-        Find the index ranges of all video tokens (within the full video token sequence)
-        that fall inside the given time interval (seconds).
-
-        Args:
-            start_sec: interval start (seconds)
-            end_sec: interval end (seconds)
-            grid_thw: video grid info, shape [num_grids, 3]; each row is (temporal blocks, height grids, width grids)
-            second_per_grid_ts: seconds per grid, length num_grids
-            spatial_merge_size: spatial merge size, default 2
-
-        Returns:
-            List[Tuple[int, int]]: index ranges of video tokens in the interval, each element is (start_idx, end_idx)
-        """
+        """Return [(start_idx, end_idx)] ranges of video tokens (in the video token sequence) overlapping [start_sec, end_sec]."""
         token_ranges = []
-        current_time_sec = 0.0  # accumulated time (seconds)
-        token_offset = 0  # total tokens before the current grid
+        current_time_sec = 0.0
+        token_offset = 0
 
-        # ensure grid_thw is a tensor
         if not isinstance(grid_thw, torch.Tensor):
             grid_thw = torch.tensor(grid_thw)
 
         num_grids = grid_thw.shape[0] if grid_thw.dim() > 1 else 1
 
-        # promote 1D grid_thw to 2D
         if grid_thw.dim() == 1:
             grid_thw = grid_thw.unsqueeze(0)
 
-        for grid_idx in range(num_grids):   # num_grids is always 1 under the current logic, so this loop is effectively a no-op
-            # current grid info
+        for grid_idx in range(num_grids):   # a single grid in practice
             t = grid_thw[grid_idx][0].item() if isinstance(grid_thw[grid_idx][0], torch.Tensor) else grid_thw[grid_idx][0]
             h = grid_thw[grid_idx][1].item() if isinstance(grid_thw[grid_idx][1], torch.Tensor) else grid_thw[grid_idx][1]
             w = grid_thw[grid_idx][2].item() if isinstance(grid_thw[grid_idx][2], torch.Tensor) else grid_thw[grid_idx][2]
 
-            # LLM grid size (token counts)
+            # LLM grid size (after spatial merge)
             llm_grid_t = t
             llm_grid_h = h // spatial_merge_size
             llm_grid_w = w // spatial_merge_size
 
-            # time interval of the current grid
             second_per_grid_t = second_per_grid_ts[grid_idx] if grid_idx < len(second_per_grid_ts) else 1.0
 
-            # time range of the current grid
             grid_start_time = current_time_sec
             grid_end_time = current_time_sec + llm_grid_t * second_per_grid_t
 
-            # check overlap between the target interval and the current grid (not expected to trigger with a single grid)
             if end_sec < grid_start_time:
-                # interval ends before this grid: early exit
                 break
-            if start_sec > grid_end_time:   # not expected to trigger with a single grid
-                # interval starts after this grid: skip it
+            if start_sec > grid_end_time:
                 current_time_sec = grid_end_time
                 token_offset += llm_grid_t * llm_grid_h * llm_grid_w
                 continue
 
-            # compute the covered temporal-block range directly (no iteration)
-            # temporal block t_idx spans [current_time_sec + t_idx * second_per_grid_t, current_time_sec + (t_idx + 1) * second_per_grid_t]
+            # Temporal blocks overlapping the interval (floor start, ceil end)
             if second_per_grid_t > 0:
-                # start block index (floor, so the start time is included)
                 relative_start = max(0, start_sec - current_time_sec)
                 t_idx_start = int(math.floor(relative_start / second_per_grid_t))
 
-                # end block index (ceil, so the end time is included)
                 relative_end = max(0, end_sec - current_time_sec)
                 t_idx_end = int(math.ceil(relative_end / second_per_grid_t))
 
-                # clamp to valid range
                 t_idx_start = max(0, min(t_idx_start, llm_grid_t))
                 t_idx_end = max(t_idx_start, min(t_idx_end, llm_grid_t))
 
-                # token index range covered by these temporal blocks
                 if t_idx_start < t_idx_end:
-                    # first token index of the start block
                     start_token_idx = token_offset + t_idx_start * llm_grid_h * llm_grid_w
-                    # last token index of the end block (exclusive)
+                    # end index is exclusive
                     end_token_idx = token_offset + t_idx_end * llm_grid_h * llm_grid_w
 
-                    # store only start and end indices
                     token_ranges.append((start_token_idx, end_token_idx))
 
-            # advance accumulated time and token offset
             current_time_sec = grid_end_time
             token_offset += llm_grid_t * llm_grid_h * llm_grid_w
         
@@ -706,112 +647,69 @@ class LazySupervisedDataset(Dataset):
         second_per_grid_ts: List[float],
         spatial_merge_size: int = 2,
     ) -> List[Tuple[int, int]]:
-        """
-        Find the index ranges of all audio tokens (within the full audio token sequence)
-        that fall inside the given time interval (seconds).
-
-        Args:
-            start_sec: interval start (seconds)
-            end_sec: interval end (seconds)
-            grid_thw: video grid info, shape [num_grids, 3]; each row is (temporal blocks, height grids, width grids)
-            audio_lengths: audio token count per grid
-            second_per_grid_ts: seconds per grid, length num_grids
-            spatial_merge_size: spatial merge size, default 2
-
-        Returns:
-            List[Tuple[int, int]]: index ranges of audio tokens in the interval, each element is (start_idx, end_idx)
-        """
+        """Return [(start_idx, end_idx)] ranges of audio tokens (in the audio token sequence) overlapping [start_sec, end_sec]."""
         token_ranges = []
-        current_time_sec = 0.0  # accumulated time (seconds)
-        audio_token_offset = 0  # total audio tokens before the current grid
+        current_time_sec = 0.0
+        audio_token_offset = 0
 
-        # ensure grid_thw is a tensor
         if not isinstance(grid_thw, torch.Tensor):
             grid_thw = torch.tensor(grid_thw)
 
         num_grids = grid_thw.shape[0] if grid_thw.dim() > 1 else 1
 
-        # promote 1D grid_thw to 2D
         if grid_thw.dim() == 1:
             grid_thw = grid_thw.unsqueeze(0)
 
         for grid_idx in range(num_grids):
-            # current grid info
             t = grid_thw[grid_idx][0].item() if isinstance(grid_thw[grid_idx][0], torch.Tensor) else grid_thw[grid_idx][0]
             h = grid_thw[grid_idx][1].item() if isinstance(grid_thw[grid_idx][1], torch.Tensor) else grid_thw[grid_idx][1]
             w = grid_thw[grid_idx][2].item() if isinstance(grid_thw[grid_idx][2], torch.Tensor) else grid_thw[grid_idx][2]
 
-            # LLM grid size
             llm_grid_t = t
             llm_grid_h = h // spatial_merge_size
             llm_grid_w = w // spatial_merge_size
 
-            # time interval and audio token count of the current grid
             second_per_grid_t = second_per_grid_ts[grid_idx] if grid_idx < len(second_per_grid_ts) else 1.0
             audio_len = audio_lengths[grid_idx] if grid_idx < len(audio_lengths) else 0
 
-            # time range of the current grid
             grid_start_time = current_time_sec
             grid_end_time = current_time_sec + llm_grid_t * second_per_grid_t
 
-            # check overlap between the target interval and the current grid (not expected to trigger with a single grid)
             if end_sec < grid_start_time:
-                # interval ends before this grid: early exit
                 break
             if start_sec > grid_end_time:
-                # interval starts after this grid: skip it
                 current_time_sec = grid_end_time
                 audio_token_offset += audio_len
                 continue
 
-            # Audio tokens are interleaved: each timestep holds per_timestep_audio_len
-            # audio tokens, and each audio token covers 0.5s starting from
-            # grid_start_time. Find which audio tokens of this grid fall in the interval.
+            # Each audio token covers 0.5s from grid_start_time
             if audio_len > 0:
-                # audio token time range within this grid
                 grid_audio_start_time = grid_start_time
                 grid_audio_end_time = grid_start_time + audio_len * 0.5
 
-                # target interval relative to this grid
                 relative_start = max(0, start_sec - grid_audio_start_time)
                 relative_end = max(0, end_sec - grid_audio_start_time)
 
-                # audio token indices (0.5s per token)
                 audio_idx_start = int(math.floor(relative_start / 0.5))
                 audio_idx_end = int(math.ceil(relative_end / 0.5))
 
-                # clamp to valid range
                 audio_idx_start = max(0, min(audio_idx_start, audio_len))
                 audio_idx_end = max(audio_idx_start, min(audio_idx_end, audio_len))
 
-                # indices within the full audio token sequence
                 if audio_idx_start < audio_idx_end:
                     start_token_idx = audio_token_offset + audio_idx_start
                     end_token_idx = audio_token_offset + audio_idx_end
                     token_ranges.append((start_token_idx, end_token_idx))
 
-            # advance accumulated time and audio token offset
             current_time_sec = grid_end_time
             audio_token_offset += audio_len
         
         return token_ranges
 
     def _jitter_tgt_for_aggregation(self, tgt, timestep_duration, video_grid_thw):
-        """Aggregation robustness (training-time interval jitter): add boundary noise to the
-        GT intervals used for <G> interval feature aggregation.
+        """Jitter GT interval boundaries by uniform(-r, r) * length for <G> feature aggregation only.
 
-        Motivation: training aggregates over exact GT intervals while inference uses
-        (imperfect) predicted intervals — this exposure bias leaves branch decoding with
-        OOD aggregated features at inference. Adding uniform(-r, r) * interval_length
-        jitter to the aggregation boundaries makes the model robust to imprecise intervals.
-        Notes:
-        - only affects video/audio_token_indices_list (aggregation indices); does not touch
-          tgt_timestep_distances (the grounding match loss GT stays exact);
-        - when tgt is laid out as [K serial intervals, K identical anchor intervals]
-          (mirrored structure), serial interval i and anchor interval i share the same
-          jitter — consistent with inference (the anchor reuses the same predicted
-          interval as serial G_j);
-        - magnitude is controlled by data_args.aggregation_jitter_ratio; 0 disables (default).
+        Mirrored dvc tgt (planning + anchors) shares one jitter per event; the match-loss GT is untouched.
         """
         r = getattr(self.data_args, "aggregation_jitter_ratio", 0.0)
         if not r or tgt is None or not isinstance(tgt, (list, tuple)) or len(tgt) < 2:
@@ -820,7 +718,7 @@ class LazySupervisedDataset(Dataset):
             pairs = [[float(tgt[i]), float(tgt[i + 1])] for i in range(0, len(tgt) - 1, 2)]
         except (ValueError, TypeError):
             return tgt
-        # upper bound on total video duration (for clamping); no bound if unavailable
+        # Video duration for clamping, if known
         duration = float("inf")
         try:
             grid = video_grid_thw[0] if isinstance(video_grid_thw, list) else video_grid_thw
@@ -841,7 +739,7 @@ class LazySupervisedDataset(Dataset):
                 s2, e2 = e2, s2
             jittered.append([s2, e2])
         if mirrored:
-            jittered = jittered + [list(p) for p in jittered]   # serial/anchor intervals share the same jitter
+            jittered = jittered + [list(p) for p in jittered]
         return [x for p in jittered for x in p]
 
     def compute_video_token_indices_from_tgt(
@@ -851,21 +749,9 @@ class LazySupervisedDataset(Dataset):
         second_per_grid_ts,
         spatial_merge_size: int = 2,
     ) -> List[List[Tuple[int, int]]]:
-        """
-        For each time interval in tgt, compute the corresponding video token index ranges.
-
-        Args:
-            tgt: flat list of times; consumed two at a time as [start_sec, end_sec]
-            video_grid_thw: video grid info
-            second_per_grid_ts: seconds per grid
-            spatial_merge_size: spatial merge size, default 2
-
-        Returns:
-            List[List[Tuple[int, int]]]: video token index ranges per time interval
-        """
+        """Video token ranges for each [start_sec, end_sec] pair in the flat list tgt."""
         video_token_indices_list = []
 
-        # tgt must be a list; consume two elements at a time as a time interval
         if isinstance(tgt, (list, tuple)) and len(tgt) >= 2:
             idx = 0
             while idx < len(tgt) - 1:
@@ -876,7 +762,6 @@ class LazySupervisedDataset(Dataset):
                     idx += 2
                     continue
                 
-                # normalize video_grid_thw to a tensor
                 if isinstance(video_grid_thw, list):
                     if len(video_grid_thw) > 0:
                         grid_thw_to_use = video_grid_thw[0] if isinstance(video_grid_thw[0], torch.Tensor) else torch.tensor(video_grid_thw[0])
@@ -888,10 +773,8 @@ class LazySupervisedDataset(Dataset):
                 else:
                     grid_thw_to_use = torch.tensor(video_grid_thw)
 
-                # normalize second_per_grid_ts to a list
                 if isinstance(second_per_grid_ts, list):
                     if len(second_per_grid_ts) > 0:
-                        # if the first element is a list, use it
                         if isinstance(second_per_grid_ts[0], list):
                             second_per_grid_ts_to_use = second_per_grid_ts[0]
                         else:
@@ -904,7 +787,6 @@ class LazySupervisedDataset(Dataset):
                 else:
                     second_per_grid_ts_to_use = [second_per_grid_ts]
 
-                # compute the indices
                 token_ranges = self.get_video_token_indices_by_time_range(
                     start_sec=start_sec,
                     end_sec=end_sec,
@@ -926,22 +808,9 @@ class LazySupervisedDataset(Dataset):
         second_per_grid_ts,
         spatial_merge_size: int = 2,
     ) -> List[List[Tuple[int, int]]]:
-        """
-        For each time interval in tgt, compute the corresponding audio token index ranges.
-
-        Args:
-            tgt: flat list of times; consumed two at a time as [start_sec, end_sec]
-            video_grid_thw: video grid info
-            audio_lengths: audio token count per grid
-            second_per_grid_ts: seconds per grid
-            spatial_merge_size: spatial merge size, default 2
-
-        Returns:
-            List[List[Tuple[int, int]]]: audio token index ranges per time interval
-        """
+        """Audio token ranges for each [start_sec, end_sec] pair in the flat list tgt."""
         audio_token_indices_list = []
 
-        # tgt must be a list; consume two elements at a time as a time interval
         if isinstance(tgt, (list, tuple)) and len(tgt) >= 2:
             idx = 0
             while idx < len(tgt) - 1:
@@ -952,7 +821,6 @@ class LazySupervisedDataset(Dataset):
                     idx += 2
                     continue
                 
-                # normalize video_grid_thw to a tensor
                 if isinstance(video_grid_thw, list):
                     if len(video_grid_thw) > 0:
                         grid_thw_to_use = video_grid_thw[0] if isinstance(video_grid_thw[0], torch.Tensor) else torch.tensor(video_grid_thw[0])
@@ -964,10 +832,8 @@ class LazySupervisedDataset(Dataset):
                 else:
                     grid_thw_to_use = torch.tensor(video_grid_thw)
                 
-                # normalize audio_lengths to a list
                 if isinstance(audio_lengths, list):
                     if len(audio_lengths) > 0:
-                        # if the first element is a list, use it
                         if isinstance(audio_lengths[0], list):
                             audio_lengths_to_use = audio_lengths[0]
                         else:
@@ -978,10 +844,8 @@ class LazySupervisedDataset(Dataset):
                 else:
                     audio_lengths_to_use = [audio_lengths] if not isinstance(audio_lengths, (list, tuple)) else audio_lengths
                 
-                # normalize second_per_grid_ts to a list
                 if isinstance(second_per_grid_ts, list):
                     if len(second_per_grid_ts) > 0:
-                        # if the first element is a list, use it
                         if isinstance(second_per_grid_ts[0], list):
                             second_per_grid_ts_to_use = second_per_grid_ts[0]
                         else:
@@ -994,7 +858,6 @@ class LazySupervisedDataset(Dataset):
                 else:
                     second_per_grid_ts_to_use = [second_per_grid_ts]
                 
-                # compute the indices
                 token_ranges = self.get_audio_token_indices_by_time_range(
                     start_sec=start_sec,
                     end_sec=end_sec,
@@ -1013,22 +876,13 @@ class LazySupervisedDataset(Dataset):
         self,
         second_per_grid_ts,
     ) -> Optional[float]:
-        """
-        Compute the duration (seconds) of each timestep.
-
-        Args:
-            second_per_grid_ts: seconds per grid; may be a list, tensor, or scalar
-
-        Returns:
-            Optional[float]: seconds per timestep, or None if it cannot be computed
-        """
+        """Seconds per timestep from second_per_grid_ts (list, tensor or scalar), or None."""
         if second_per_grid_ts is None:
             return None
 
-        # take the first value (second_per_grid_t is normally identical across grids)
+        # Same for all grids; take the first
         if isinstance(second_per_grid_ts, list):
             if len(second_per_grid_ts) > 0:
-                # if the first element is a list, take its first element
                 if isinstance(second_per_grid_ts[0], list):
                     second_per_grid_t = second_per_grid_ts[0][0]
                 else:
@@ -1038,7 +892,6 @@ class LazySupervisedDataset(Dataset):
         else:
             second_per_grid_t = second_per_grid_ts
         
-        # convert to a numeric value
         if second_per_grid_t is None:
             return None
         
@@ -1059,14 +912,10 @@ class LazySupervisedDataset(Dataset):
         audio_lengths: Optional[List[int]] = None,
         spatial_merge_size: int = 2,
     ) -> Tuple[List[List[Tuple[int, int]]], List[List[Tuple[int, int]]]]:
-        """
-        Partition by physical temporal blocks: num_timesteps = sum of T over the rows of
-        video_grid_thw. For each physical time interval [start_sec, end_sec], compute the
-        video and audio token indices that fall inside it.
+        """Video and audio token ranges of each temporal block (timestep).
 
         Returns:
-            video_ranges_per_timestep: length num_timesteps; each item is the video token index ranges List[Tuple[int,int]] of that block
-            audio_ranges_per_timestep: same, but audio token index ranges ([] per step when there is no audio)
+            (video_ranges_per_timestep, audio_ranges_per_timestep); audio entries are [] without audio.
         """
         if isinstance(video_grid_thw, torch.Tensor):
             grid_thw = video_grid_thw.clone()
@@ -1159,11 +1008,7 @@ class LazySupervisedDataset(Dataset):
         return s, e
     
     def interval_distance_closed(a: float, b: float, s: float, e: float) -> float:
-        """
-        Minimum gap between two closed float intervals [a,b] and [s,e].
-        Overlap (including touching endpoints) => 0.0
-        """
-        # normalize
+        """Gap between closed intervals [a, b] and [s, e]; 0 if they overlap or touch."""
         if a > b:
             a, b = b, a
         if s > e:
@@ -1177,19 +1022,7 @@ class LazySupervisedDataset(Dataset):
         num_timesteps: int,
         timestep_duration: float,
     ) -> Optional[List[List[float]]]:
-        """
-        Compute the distance between each time interval in tgt and every timestep.
-
-        Args:
-            tgt: flat list of times; every two elements form one interval [start_sec, end_sec]
-            num_timesteps: number of timesteps
-            timestep_duration: duration of each timestep (seconds)
-
-        Returns:
-            Optional[List[List[float]]]: per-interval distances to all timesteps,
-            formatted as [[d1, d2, ...], [d1, d2, ...], ...];
-            None if it cannot be computed
-        """
+        """Distance (seconds) from each [start, end] pair in tgt to every timestep: [[d_0, ..., d_T-1], ...] or None."""
         if tgt is None or not isinstance(tgt, (list, tuple)) or len(tgt) < 2:
             return None
         
@@ -1198,22 +1031,18 @@ class LazySupervisedDataset(Dataset):
         
         distances_list = []
         
-        # consume two elements at a time as one interval
         idx = 0
         while idx < len(tgt) - 1:
             try:
-                a = float(tgt[idx])      # interval start
-                b = float(tgt[idx + 1])  # interval end
+                a = float(tgt[idx])
+                b = float(tgt[idx + 1])
             except (ValueError, TypeError):
                 idx += 2
                 continue
 
-            # distance between this interval and every timestep
             timestep_distances = []
             for k in range(num_timesteps):
-                # interval of the k-th timestep
                 s, e = LazySupervisedDataset.token_interval(k, timestep_duration)
-                # compute the distance
                 distance = LazySupervisedDataset.interval_distance_closed(a, b, s, e)
                 timestep_distances.append(distance)
             
@@ -1228,24 +1057,10 @@ class LazySupervisedDataset(Dataset):
         video_grid_thw,
         timestep_duration: Optional[float],
     ) -> Optional[List[List[float]]]:
-        """
-        Extract the number of timesteps from video_grid_thw, then compute the distance
-        between each time interval in tgt and every timestep.
-
-        Args:
-            tgt: flat list of times; every two elements form one interval [start_sec, end_sec]
-            video_grid_thw: video grid info; may be a tensor, list, or scalar
-            timestep_duration: duration of each timestep (seconds)
-
-        Returns:
-            Optional[List[List[float]]]: per-interval distances to all timesteps,
-            formatted as [[d1, d2, ...], [d1, d2, ...], ...];
-            None if it cannot be computed
-        """
+        """compute_tgt_timestep_distances with the timestep count taken from video_grid_thw."""
         if tgt is None or video_grid_thw is None or timestep_duration is None:
             return None
 
-        # get the number of timesteps
         if not isinstance(video_grid_thw, Sequence):
             video_grid_thw_list = [video_grid_thw]
         else:
@@ -1265,7 +1080,6 @@ class LazySupervisedDataset(Dataset):
         else:
             num_timesteps = int(grid_thw)
         
-        # compute the distances
         return self.compute_tgt_timestep_distances(
             tgt=tgt,
             num_timesteps=num_timesteps,
@@ -1273,15 +1087,13 @@ class LazySupervisedDataset(Dataset):
         )
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        num_base_retries = 3    # retry a failed sample read 3 times
+        num_base_retries = 3
 
-        # try the current sample first
         for attempt_idx in range(num_base_retries):
             try:
                 sample = self._get_item(i)
                 return sample
             except Exception as e:
-                # sleep 1s in case it is a cloud disk issue
                 print(f"[Try #{attempt_idx}] Failed to fetch sample {i}. Exception:", e)
                 time.sleep(1)
 
@@ -1300,7 +1112,6 @@ class LazySupervisedDataset(Dataset):
                 sources = [sources]
             assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
 
-            # define some variables
             grid_thw_merged = None
             video_grid_thw_merged = None
             grid_thw = None
@@ -1309,7 +1120,7 @@ class LazySupervisedDataset(Dataset):
             audio = None
             audio_lengths = None
 
-            if "image" in sources[0]:   # not taken for this data
+            if "image" in sources[0]:
                 image_file = self.list_data_dict[i]["image"]
                 if isinstance(image_file, List):
                     if len(image_file) > 1:
@@ -1333,9 +1144,9 @@ class LazySupervisedDataset(Dataset):
                     merged_thw.prod() // self.data_args.image_processor.merge_size**2
                     for merged_thw in grid_thw_merged
                 ]
-            if "video" in sources[0]:   # taken for this data
-                video_file = sources[0]["video"]    # video path
-                if isinstance(video_file, List):    # not taken
+            if "video" in sources[0]:
+                video_file = sources[0]["video"]
+                if isinstance(video_file, List):
                     if len(video_file) > 1:
                         video_file = [
                             file for file in video_file
@@ -1348,27 +1159,26 @@ class LazySupervisedDataset(Dataset):
                             video_file
                         )
                         video = [video]
-                else:   # taken for this data
-                    # process the video
-                    video, video_grid_thw, second_per_grid_ts = self.process_video(video_file)   # video_grid_thw is the token count along the t/h/w dims
-                    video = [video] # video shape [t*h*w, c], c is the visual encoder output dim
+                else:
+                    video, video_grid_thw, second_per_grid_ts = self.process_video(video_file)
+                    video = [video] # [t*h*w, c]
                 if "use_audio" in sources[0] and sources[0]["use_audio"]:
-                    audio, audio_lengths = self.process_audio(video_file)    # audio: [num 30s chunks (e.g. 3), 128 mel bands, num 10ms features]
-                else:    # audio_lengths: token count per audio chunk, one token per 0.5s (30s chunks, rounded up); the Q-Former compresses each 0.5s of audio into one token
+                    audio, audio_lengths = self.process_audio(video_file)    # [num 30s chunks, 128 mels, frames]; one token per 0.5s
+                else:
                     audio, audio_lengths = None, None
                 video_grid_thw_merged = copy.deepcopy(video_grid_thw)
                 if not isinstance(video_grid_thw, Sequence):
                     video_grid_thw_merged = [video_grid_thw_merged]
                     video_grid_thw = [video_grid_thw]
                          
-            if "audio" in sources[0]:   # audio-only samples; video samples with audio are handled in the video branch above
+            if "audio" in sources[0]:   # audio-only samples
                 audio_file = sources[0]["audio"]
                 audio, audio_lengths = self.process_audio(
                     audio_file
                 )
             chat_sources = copy.deepcopy([e["conversations"] for e in sources])
             gpt_value_segments = sources[0].get("gpt_value_segments", None)
-            data_dict = preprocess_qwen_2_visual(   # produces input_ids and labels (labels = input_ids with the question part set to -100); interleaving is already applied
+            data_dict = preprocess_qwen_2_visual(   # input_ids / labels with interleaved placeholders
                 chat_sources,
                 self.tokenizer,
                 grid_thw_image=grid_thw_merged if grid_thw_merged else None,
@@ -1379,7 +1189,7 @@ class LazySupervisedDataset(Dataset):
                 gpt_value_segments=gpt_value_segments if gpt_value_segments else None
             )
             
-            position_ids, _ = self.get_rope_index(  # tensor of shape (3, batch_size, sequence_length); dim 0: time / height / width position encodings
+            position_ids, _ = self.get_rope_index(  # (3, batch_size, seq_len): time / height / width
                 self.data_args.image_processor.merge_size,
                 data_dict["input_ids"],
                 image_grid_thw=torch.stack(grid_thw, dim=0) if grid_thw else None,
@@ -1388,20 +1198,15 @@ class LazySupervisedDataset(Dataset):
                 ),
                 second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
                 audio_lengths=audio_lengths if audio_lengths else None,
-            )   # position encodings aligned with the interleaved sequence
+            )
 
-            # adjust position ids for the parallel part.
-            # The key is always set (None for single-event tasks) so the collated list keeps one
-            # entry per sample: the model indexes it by batch position, and a shorter list would
-            # silently misalign or go out of range.
+            # Parallel positions; the key is always set (None if single-event) since the model indexes it by batch position
             data_dict["parallel_start_idx"] = None
             if data_dict["event_id"] is not None:
                 position_ids, parallel_start_idx = adjust_position_ids_for_parallel(position_ids, data_dict["event_id"], len(gpt_value_segments))
                 data_dict["parallel_start_idx"] = parallel_start_idx
 
-            chosen_position_ids = None
-            reject_position_ids = None
-            if "image" not in sources[0] and "video" not in sources[0] and "audio" not in sources[0]:   # not taken for this data
+            if "image" not in sources[0] and "video" not in sources[0] and "audio" not in sources[0]:
                 grid_thw_merged = None
                 sources = copy.deepcopy([e["conversations"] for e in sources])
                 data_dict = preprocess_qwen_2_visual(
@@ -1415,15 +1220,12 @@ class LazySupervisedDataset(Dataset):
                 )
 
             data_dict["position_ids"] = position_ids
-            data_dict["chosen_position_ids"] = chosen_position_ids
-            data_dict["reject_position_ids"] = reject_position_ids
             data_dict["attention_mask"] = [data_dict["input_ids"][0].size(0)]
             if "image" in self.list_data_dict[i]:
                 data_dict["pixel_values"] = torch.cat(image, dim=0)
                 data_dict["image_grid_thw"] = torch.cat(
                     [thw.unsqueeze(0) for thw in grid_thw], dim=0
                 )
-            # video exist in the data
             elif "video" in self.list_data_dict[i]:
                 data_dict["pixel_values_videos"] = torch.cat(video, dim=0)  # [t*h*w, channels]
                 data_dict["video_grid_thw"] = torch.cat(
@@ -1433,20 +1235,15 @@ class LazySupervisedDataset(Dataset):
                 audio = torch.cat(audio, dim=0)
             data_dict["audio_feature"] = audio
             data_dict["audio_lengths"] = audio_lengths
-            if data_dict["chosen_ids"] is None and self.data_args.train_type != "grpo":
-                data_dict["train_type"] = "sft"
-            else:
-                data_dict["train_type"] = self.data_args.train_type
 
-            # G-token path
-            # tgt/src are usually strings or lists; keep the original format, no tensor conversion needed
+            # Grounding inputs (<G> path); tgt/src are kept as raw lists
             if self.use_evidence:
                 timestep_duration = self.compute_timestep_duration(second_per_grid_ts=second_per_grid_ts)
                 data_dict["timestep_duration"] = timestep_duration
                 data_dict["tgt"] = sources[0].get("tgt", None)
                 data_dict["src"] = sources[0].get("src", None)
 
-                # distance between each tgt interval and every timestep (one value per timestep; 0 inside the interval, growing outside). Used as a smoothing coefficient for the grounding loss, same as D2vlm; timestep count depends on the sampling rate
+                # Per-timestep distance to each GT interval (0 inside); soft target of the grounding loss
                 tgt_timestep_distances = self.compute_tgt_timestep_distances_from_grid(
                     tgt=data_dict["tgt"],
                     video_grid_thw=video_grid_thw,
@@ -1454,11 +1251,11 @@ class LazySupervisedDataset(Dataset):
                 )
                 data_dict["tgt_timestep_distances"] = tgt_timestep_distances
                 
-                # aggregation robustness: jittered tgt used only for aggregation indices (match-loss GT distances above were already computed from the exact tgt)
+                # Jittered tgt for <G> aggregation only
                 tgt_for_aggregation = self._jitter_tgt_for_aggregation(
                     data_dict["tgt"], timestep_duration, video_grid_thw)
 
-                # with video and tgt info, compute the relative video token indices for each GT interval (first video token is 0)
+                # Video/audio token ranges per tgt interval (relative to the first media token)
                 if data_dict["tgt"] is not None and video_grid_thw is not None and second_per_grid_ts is not None:
                     video_token_indices_list = self.compute_video_token_indices_from_tgt(
                         tgt=tgt_for_aggregation,
@@ -1470,7 +1267,6 @@ class LazySupervisedDataset(Dataset):
                 else:
                     data_dict["video_token_indices_list"] = None
 
-                # likewise, with audio and tgt info, compute the audio token indices per interval
                 if data_dict["tgt"] is not None and video_grid_thw is not None and audio_lengths is not None and second_per_grid_ts is not None:
                     audio_token_indices_list = self.compute_audio_token_indices_from_tgt(
                         tgt=tgt_for_aggregation,
@@ -1483,7 +1279,7 @@ class LazySupervisedDataset(Dataset):
                 else:
                     data_dict["audio_token_indices_list"] = None
 
-                # similarly, with video and src info, compute the video token indices per src interval
+                # Video/audio token ranges per src (query) interval
                 if data_dict["src"] is not None and video_grid_thw is not None and second_per_grid_ts is not None:
                     video_token_indices_list = self.compute_video_token_indices_from_tgt(
                         tgt=data_dict["src"],
@@ -1495,7 +1291,6 @@ class LazySupervisedDataset(Dataset):
                 else:
                     data_dict["video_token_indices_list_src"] = None
 
-                # likewise, with audio and src info, compute the audio token indices per src interval
                 if data_dict["src"] is not None and video_grid_thw is not None and audio_lengths is not None and second_per_grid_ts is not None:
                     audio_token_indices_list = self.compute_audio_token_indices_from_tgt(
                         tgt=data_dict["src"],
@@ -1508,7 +1303,7 @@ class LazySupervisedDataset(Dataset):
                 else:
                     data_dict["audio_token_indices_list_src"] = None
 
-                # per physical temporal block: video/audio token indices per block (tokens in one block share the same physical time)
+                # Video/audio token ranges per timestep
                 if video_grid_thw is not None and second_per_grid_ts is not None:
                     try:
                         v_per_ts, a_per_ts = self.compute_video_audio_token_indices_per_timestep(
@@ -1526,7 +1321,9 @@ class LazySupervisedDataset(Dataset):
                     data_dict["video_token_indices_per_timestep"] = None
                     data_dict["audio_token_indices_per_timestep"] = None
 
-            # test-set path
+            # Task name (per-task inference options key on it)
+            data_dict["task"] = sources[0].get('task', None)
+            # Test: keep only the prompt and attach metadata
             if self.data_args.run_test:
                 labels = data_dict.pop("labels", None)
                 len_input = sum(labels[0] == IGNORE_INDEX)
@@ -1551,13 +1348,9 @@ class LazySupervisedDataset(Dataset):
                 data_dict["task"] = sources[0].get('task', None)
                 data_dict["video_id"] = sources[0].get('video_id', None)
                 data_dict["should_use"] = sources[0].get("should_use", True)
+                # Query interval in seconds, for src_interval_override
+                data_dict["src_sec"] = sources[0].get("src", None)
 
-                data_dict.pop("chosen_ids", None)
-                data_dict.pop("reject_ids", None)
-                data_dict.pop("chosen_position_ids", None)
-                data_dict.pop("reject_position_ids", None)
-                data_dict.pop("chosen_labels", None)
-                data_dict.pop("reject_labels", None)
                 data_dict.pop("audio_lengths", None)
 
                 data_dict.pop("tgt", None)
@@ -1615,24 +1408,12 @@ class DataCollatorForSupervisedDataset(object):
         )
         input_ids, labels, position_ids, attention_mask = self.process_ids(
             input_ids, labels, position_ids
-        ) # pad to the same length and cap at the max length
-        chosen_ids = chosen_labels = chosen_position_ids = chosen_attention_mask = None
-        reject_ids = reject_labels = reject_position_ids = reject_attention_mask = None
-        train_type = [instance["train_type"] for instance in instances][0]
+        ) # pad and truncate to model_max_length
         batch = dict(
             input_ids=input_ids,
             labels=labels,
             position_ids=position_ids,
-            chosen_ids=chosen_ids,
-            chosen_labels=chosen_labels,
-            chosen_position_ids=chosen_position_ids,
-            reject_ids=reject_ids,
-            reject_labels=reject_labels,
-            reject_position_ids=reject_position_ids,
             attention_mask=attention_mask,
-            chosen_attention_mask=chosen_attention_mask,
-            reject_attention_mask=reject_attention_mask,
-            train_type=train_type,
         )
         images = list(
             instance["pixel_values"]
@@ -1692,7 +1473,7 @@ class DataCollatorForSupervisedDataset(object):
         batch["audio_feature"] = concat_audios
         batch["audio_lengths"] = audio_lengths
         
-        # handle tgt/src (when use_evidence=True)
+        # Grounding fields (use_evidence)
         if self.use_evidence:
             tgt_list = [instance.get("tgt", None)  for instance in instances if "tgt" in instance]
             
@@ -1701,7 +1482,6 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch["tgt"] = None
             
-            # collect video_token_indices_list and audio_token_indices_list
             video_token_indices_list = [
                 instance.get("video_token_indices_list", None)
                 for instance in instances
@@ -1742,7 +1522,6 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch["audio_token_indices_list_src"] = None
 
-            # collect timestep_duration (seconds per timestep)
             timestep_duration_list = [
                 instance.get("timestep_duration", None)
                 for instance in instances
@@ -1753,7 +1532,6 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch["timestep_duration"] = None
             
-            # collect tgt_timestep_distances (per-interval distances to all timesteps)
             tgt_timestep_distances_list = [
                 instance.get("tgt_timestep_distances", None)
                 for instance in instances
@@ -1764,7 +1542,6 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch["tgt_timestep_distances"] = None
 
-            # collect video/audio token indices partitioned by physical temporal block
             video_token_indices_per_timestep_list = [
                 instance.get("video_token_indices_per_timestep", None)
                 for instance in instances
@@ -1785,14 +1562,13 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch["audio_token_indices_per_timestep"] = None
 
-            # collect event_id and parallel_start_idx. Unlike the lists above, these two are indexed
-            # by batch position in the model, so every instance must contribute an entry (None for
-            # single-event tasks) -- filtering on key presence would shorten the list and misalign it.
+            # Indexed by batch position: keep one entry per instance (None for single-event tasks)
             event_id_list = [instance.get("event_id", None) for instance in instances]
             if any(x is not None for x in event_id_list):
                 batch["event_id"] = event_id_list
             else:
                 batch["event_id"] = None
+            batch["task"] = [instance.get("task", None) for instance in instances]
 
             parallel_start_idx_list = [instance.get("parallel_start_idx", None) for instance in instances]
             if any(x is not None for x in parallel_start_idx_list):
@@ -1800,21 +1576,17 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch["parallel_start_idx"] = None
 
-            # collect last_text_token_indices
             last_text_token_indices_list = [
                 instance.get("last_text_token_indices", None)
                 for instance in instances
                 if "last_text_token_indices" in instance
             ]
             if len(last_text_token_indices_list) > 0 and any(x is not None for x in last_text_token_indices_list):
-                # filter out None values, then stack into a tensor
                 valid_indices = [x for x in last_text_token_indices_list if x is not None]
                 if len(valid_indices) > 0:
-                    # stack when all elements are tensors
                     if all(isinstance(x, torch.Tensor) for x in valid_indices):
                         batch["last_text_token_indices"] = torch.stack(valid_indices)
                     else:
-                        # otherwise convert to a tensor
                         batch["last_text_token_indices"] = torch.tensor(valid_indices, dtype=torch.long)
                 else:
                     batch["last_text_token_indices"] = None

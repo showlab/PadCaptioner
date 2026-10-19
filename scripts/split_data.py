@@ -1,3 +1,5 @@
+# Split a JSON list into N equal shards (padded with should_use=False copies).
+# Usage: python split_data.py <data.json> <num_shards> <out_dir>
 import json
 import sys
 import os
@@ -34,7 +36,6 @@ if __name__ == "__main__":
     total_count = 0
 
     for i in range(int(split_num) - 1):
-        # data_file = f"{target_dir}/{i}.json"
         data_file = os.path.join(target_dir, f"{i}.json")
         print(data_file)
         with open(data_file, "w") as f:
@@ -45,46 +46,3 @@ if __name__ == "__main__":
     data_file = os.path.join(target_dir, f"{int(split_num) - 1}.json")
     with open(data_file, "w") as f:
         json.dump(data[total_count:], f, indent=2)
-
-# data_file = "/mnt/bn/tiktok-mm-3/aiic/users/tangchangli/preprocess_dataset/ytb60CapwAsrAac0-7k10-22kSpeakFiltBadAsr_detailPrompt.json"
-
-# with open (data_file, "r") as f:
-#     data = json.load(f)
-
-# # prev_data = random.sample(data, 10)
-
-# per_len = len(data) // 6
-
-# data1 = data[:per_len]
-# data2 = data[per_len*1:per_len*2]
-# data3 = data[per_len*2:per_len*3]
-# data4 = data[per_len*3:per_len*4]
-# data5 = data[per_len*4:per_len*5]
-# data6 = data[per_len*5:]
-
-# data_file1 = "/mnt/bn/tiktok-mm-3/aiic/users/liyixuan/preprocessed_data/dpo_pipeline_gooddata_detail1.json"
-# data_file2 = "/mnt/bn/tiktok-mm-3/aiic/users/liyixuan/preprocessed_data/dpo_pipeline_gooddata_detail2.json"
-# data_file3 = "/mnt/bn/tiktok-mm-3/aiic/users/liyixuan/preprocessed_data/dpo_pipeline_gooddata_detail3.json"
-# data_file4 = "/mnt/bn/tiktok-mm-3/aiic/users/liyixuan/preprocessed_data/dpo_pipeline_gooddata_detail4.json"
-# data_file5 = "/mnt/bn/tiktok-mm-3/aiic/users/liyixuan/preprocessed_data/dpo_pipeline_gooddata_detail5.json"
-# data_file6 = "/mnt/bn/tiktok-mm-3/aiic/users/liyixuan/preprocessed_data/dpo_pipeline_gooddata_detail6.json"
-
-# print(len(data1), len(data2), len(data6))
-
-# with open(data_file1, "w") as f:
-#     json.dump(data1, f, indent=2)
-
-# with open(data_file2, "w") as f:
-#     json.dump(data2, f, indent=2)
-
-# with open(data_file3, "w") as f:
-#     json.dump(data3, f, indent=2)
-
-# with open(data_file4, "w") as f:
-#     json.dump(data4, f, indent=2)
-
-# with open(data_file5, "w") as f:
-#     json.dump(data5, f, indent=2)
-
-# with open(data_file6, "w") as f:
-#     json.dump(data6, f, indent=2)

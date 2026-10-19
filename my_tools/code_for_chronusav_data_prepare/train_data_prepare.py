@@ -1,27 +1,8 @@
-"""Build PadCaptioner training annotations from per-video audio-visual segment labels.
+"""Build PadCaptioner training annotations (7 tasks per video: v2t, a2t, t2v, t2a, v2a, a2v, dvc).
 
-Each input video yields 7 samples, one per task:
-  v2t / a2t  grounding        - given a visual / audio description, output the time span
-  t2v / t2a  seg captioning   - given a time span, describe its visual / audio content
-  v2a / a2v  captioning       - given one modality's description, describe the other
-  dvc        dense captioning - list every event with its time span and caption
-
-Input: a JSON list, one entry per video, with fields
-  id              video id; the video file is expected at <video_dir>/<id>.mp4
-  duration        video length in seconds
-  category        free-form category string, copied through to the output
-  segment_num     number of annotated segments
-  seg_time        list of [start, end] per segment; seconds or "HH:MM:SS.fff"
-  audio_captions  list of audio captions, one per segment
-  video_captions  list of visual captions, one per segment
-
-Output: a JSON list in the training schema documented in README.md.
-
-Usage:
-  python train_data_prepare.py \
-      --data_path  /path/to/segment_labels.json \
-      --save_path  /path/to/train_annotations.json \
-      --video_dir  /path/to/videos
+Input: JSON list of videos with id, duration, category, segment_num, seg_time ([start, end] in
+seconds or "HH:MM:SS.fff"), audio_captions, video_captions; videos are read from <video_dir>/<id>.mp4.
+Usage: python train_data_prepare.py --data_path labels.json --save_path train.json --video_dir /path/to/videos
 """
 import os
 import json
@@ -39,7 +20,7 @@ def parse_args():
 
 
 def _timestamp_to_seconds(val):
-    """Convert a single timestamp to seconds. Supports numbers (seconds), 'HH:MM:SS', 'MM:SS', 'HH:MM:SS.fff'."""
+    """Timestamp (seconds, 'MM:SS', 'HH:MM:SS' or 'HH:MM:SS.fff') -> seconds."""
     if isinstance(val, (int, float)):
         return float(val)
     s = str(val).strip()
@@ -66,7 +47,7 @@ def _timestamp_to_seconds(val):
 
 
 def seg_to_seconds(seg):
-    """Convert one seg_time entry (e.g. [start, end]) to a list of numeric seconds."""
+    """seg_time entry (e.g. [start, end]) -> list of seconds."""
     if seg is None:
         return []
     if isinstance(seg, (list, tuple)) and len(seg) >= 2:
@@ -77,7 +58,7 @@ def seg_to_seconds(seg):
 
 
 def ensure_1d(lst):
-    """Flatten a list to 1D; a list of scalars is returned unchanged."""
+    """Flatten one level of nesting."""
     if lst is None or len(lst) == 0:
         return [] if lst is not None else []
     out = []
@@ -90,7 +71,7 @@ def ensure_1d(lst):
 
 
 def add_sample(out_list, sample, task, longvale_task, video_dir, *, tgt=None, src=None, human_value, gpt_value, gpt_value_segments=None):
-    """Build one sample and append it to out_list. Pass either tgt or src; both are flattened to 1D. gpt_value_segments is used by DVC-style tasks only."""
+    """Append one training sample; tgt/src are flattened, gpt_value_segments is dvc only."""
     vid = sample["id"]
     entry = {
         "id": vid,
@@ -188,7 +169,7 @@ if __name__ == "__main__":
     for sample in anno:
         segment_num = sample['segment_num']
 
-        # step1: sample three random segments for grounding / seg_captioning / captioning; allow repeats when fewer than three exist
+        # Pick three segments (repeats allowed when fewer than three exist)
         if segment_num >= 3:
             rand_idx1, rand_idx2, rand_idx3 = random.sample(range(segment_num), 3)
         elif segment_num >= 1:
@@ -196,7 +177,6 @@ if __name__ == "__main__":
         else:
             rand_idx1 = rand_idx2 = rand_idx3 = 0
 
-        # segments (converted to numeric seconds) and captions for the three picks
         seg1 = seg_to_seconds(sample["seg_time"][rand_idx1])
         v1, a1 = sample["video_captions"][rand_idx1], sample["audio_captions"][rand_idx1]
         seg2 = seg_to_seconds(sample["seg_time"][rand_idx2])
@@ -204,30 +184,26 @@ if __name__ == "__main__":
         seg3 = seg_to_seconds(sample["seg_time"][rand_idx3])
         v3, a3 = sample["video_captions"][rand_idx3], sample["audio_captions"][rand_idx3]
 
-        # Single-event tasks are plain autoregressive: one planning <G> (its embedding carries
-        # the event's aggregated interval feature), then the answer text follows serially.
-        # No anchor stage, no <S>/<shift>, tgt holds the interval once, and gpt_value_segments
-        # is omitted (its presence is what routes a sample through the parallel-decoding path).
-        # grounding: v2t, a2t (one random human template per task) - the answer is the interval
-        # read out from <G>, so the gpt turn is the single token
+        # Single-event tasks: one <G> then serial text; no gpt_value_segments (that marks the parallel dvc path).
+        # Grounding: v2t, a2t (the answer is the interval read out from <G>)
         add_sample(converted_samples, sample, "v2t", "grounding", args.video_dir, tgt=seg1,
                    human_value=random.choice(v2t_prompt_templates).format(query=v1), gpt_value="<G>")
         add_sample(converted_samples, sample, "a2t", "grounding", args.video_dir, tgt=seg1,
                    human_value=random.choice(a2t_prompt_templates).format(query=a1), gpt_value="<G>")
 
-        # seg_captioning: t2v, t2a (the prompt's <G> carries the given src interval)
+        # Segment captioning: t2v, t2a (the prompt's <G> carries the src interval)
         add_sample(converted_samples, sample, "t2v", "seg_captioning", args.video_dir, src=seg2, tgt=seg2,
                    human_value=random.choice(t2v_prompt_templates), gpt_value="<G>" + v2)
         add_sample(converted_samples, sample, "t2a", "seg_captioning", args.video_dir, src=seg2, tgt=seg2,
                    human_value=random.choice(t2a_prompt_templates), gpt_value="<G>" + a2)
-        # DVC (tgt flattened to 1D: [start, end] of each segment concatenated in order)
+        # dvc: tgt = all [start, end] pairs, repeated for planning and anchor <G>s
         caption = ['Visual: ' + v + ' Audio: ' +  a for v, a in zip(sample["video_captions"], sample["audio_captions"])]
         caption_answer = "<G>" * len(caption) + "<shift>" + "<G>" * len(caption) + "<shift>" + "<shift>".join(caption)
         seg_time_sec = [seg_to_seconds(s) for s in sample["seg_time"]]
         tgt_dvc_1d = [x for seg in seg_time_sec for x in seg]
         add_sample(converted_samples, sample, "dvc", "captioning", args.video_dir, tgt=tgt_dvc_1d * 2,
                    human_value=random.choice(dvc_prompt_templates), gpt_value=caption_answer, gpt_value_segments=caption)
-        # cross-modal captioning: v2a, a2v (rand_idx3) - same single-event serial format
+        # Cross-modal captioning: v2a, a2v
         add_sample(converted_samples, sample, "v2a", "captioning", args.video_dir, tgt=seg3,
                    human_value=random.choice(v2a_prompt_templates).format(query=v3), gpt_value="<G>" + a3)
         add_sample(converted_samples, sample, "a2v", "captioning", args.video_dir, tgt=seg3,
